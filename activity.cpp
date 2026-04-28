@@ -1,7 +1,7 @@
 #include "activity.h"
 #include "config.h"
 #include "data.h"
-#include "logger.h"
+
 #include <ArduinoJson.h>
 #include <time.h>
 
@@ -24,7 +24,7 @@ static String topicActivity;
 // ==========================================
 void activityBuildTopic(const String& device_id) {
   topicActivity = "isems/devices/" + device_id + "/activity";
-  logPrintf("[Activity] Topic: %s\n", topicActivity.c_str());
+  Serial.Printf("[Activity] Topic: %s\n", topicActivity.c_str());
 }
 
 // ==========================================
@@ -38,9 +38,9 @@ void activityInit() {
   if (sensorIsHealthy()) {
     lastKnownState = currentFrame;
     stateInitialized = true;
-    logPrintln("[Activity] Initialized with current AC state");
+    Serial.Println("[Activity] Initialized with current AC state");
   } else {
-    logPrintln("[Activity] Waiting for valid sensor frame...");
+    Serial.Println("[Activity] Waiting for valid sensor frame...");
   }
 
   if (sensorIsDisplayHealthy()) {
@@ -99,7 +99,7 @@ String activityTypeToString(ActivityType type) {
 // ==========================================
 static void publishActivity(const ActivityEvent& event) {
   if (!dataIsConnected()) {
-    logPrintln("[Activity] Cannot publish - MQTT not connected");
+    Serial.Println("[Activity] Cannot publish - MQTT not connected");
     return;
   }
   
@@ -144,7 +144,7 @@ static void publishActivity(const ActivityEvent& event) {
   serializeJson(doc, payload);
   
   dataPublishRaw(topicActivity, payload);
-  logPrintln("[Activity] ✓ Published: " + event.description);
+  Serial.Println("[Activity] Published: " + event.description);
 }
 
 // ==========================================
@@ -162,13 +162,13 @@ static String buildDescription(const ActivityEvent& event) {
       desc = "AC turned OFF";
       break;
     case ACT_MODE_CHANGE:
-      desc = "Mode changed: " + event.old_mode + " → " + event.new_mode;
+      desc = "Mode changed: " + event.old_mode + " -> " + event.new_mode;
       break;
     case ACT_FAN_CHANGE:
-      desc = "Fan speed changed: " + event.old_fan + " → " + event.new_fan;
+      desc = "Fan speed changed: " + event.old_fan + " -> " + event.new_fan;
       break;
     case ACT_TEMP_CHANGE:
-      desc = "Set temperature changed: " + String(event.old_temp) + "°C → " + String(event.new_temp) + "°C";
+      desc = "Set temperature changed: " + String(event.old_temp) + "C -> " + String(event.new_temp) + "C";
       break;
     case ACT_MANUAL_OVERRIDE:
       desc = "Manual control activated - Automation paused";
@@ -196,7 +196,7 @@ void activityTrackChange(
   ActivitySource source
 ) {
   if (!newState.valid) {
-    logPrintln("[Activity] Invalid new state, skipping");
+    Serial.Println("[Activity] Invalid new state, skipping");
     return;
   }
   
@@ -204,7 +204,7 @@ void activityTrackChange(
   if (!stateInitialized) {
     lastKnownState = newState;
     stateInitialized = true;
-    logPrintln("[Activity] State initialized");
+    Serial.Println("[Activity] State initialized");
     return;
   }
   

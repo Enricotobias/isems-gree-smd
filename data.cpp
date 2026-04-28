@@ -1,7 +1,7 @@
 #include "data.h"
 #include "config.h"
 #include "controll.h"
-#include "logger.h"
+
 #include "crash_monitor.h"
 #include "automation.h"
 #include "ir_health.h"
@@ -19,7 +19,6 @@
 static String topicStatus;      // isems/devices/{id}/status
 static String topicData;        // isems/devices/{id}/data
 static String topicSetting;     // isems/devices/{id}/setting
-static String topicLogs;        // isems/devices/{id}/logs
 
 static String cmdSetting;       // isems/command/{id}/setting
 static String cmdKoneksi;       // isems/command/{id}/koneksi
@@ -27,10 +26,8 @@ static String cmdSchedule;      // isems/command/{id}/schedule
 static String cmdRemote;        // isems/command/{id}/remote
 static String cmdReboot;        // isems/command/{id}/reboot
 static String cmdInfo;          // isems/command/{id}/info
-static String cmdLogs;          // isems/command/{id}/logs
 
 String topicCmdUpdate = "";
-static String cmdDiagnostics = "";
 String topicInfo = "";
 
 String topicAck = ""; 
@@ -43,9 +40,6 @@ bool isManualDisconnect = false; // <--- TAMBAHKAN INI (Flag penanda)
 
 static bool pendingSaveRequest = false;
 static unsigned long saveRequestTime = 0;
-
-extern bool forceScheduleCheck;
-extern volatile unsigned long wifiDisconnectEpoch;
 extern bool rtcOK;
 
 static BPFrame lastKnownState = {false, false, 0, "", "", 0, "", "", "", ""};
@@ -148,8 +142,6 @@ static void handleCmdSetting(const char* payload, unsigned int length);
 static void handleCmdKoneksi(const char* payload, unsigned int length);
 static void handleCmdSchedule(const char* payload, unsigned int length);
 static void handleCmdRemote(const char* payload, unsigned int length);
-static void handleCmdLogs(const char* payload, unsigned int length);
-static void publishLogs(const String& message);
 static void serviceNearbyWifiScan();
 
 // ============= Build Topics =============
@@ -160,7 +152,6 @@ void dataBuildTopics(const String& device_id) {
   topicSetting = "isems/devices/" + device_id + "/setting";
   topicInfo = "isems/devices/" + device_id + "/info";
   topicAck = "isems/devices/" + device_id + "/ack";
-  topicLogs = "isems/devices/" + device_id + "/logs";
   activityBuildTopic(device_id);
   
   // Command topics
@@ -170,15 +161,10 @@ void dataBuildTopics(const String& device_id) {
   cmdRemote   = "isems/command/" + device_id + "/remote";
   topicCmdUpdate = "isems/command/" + device_id + "/update";
   cmdReboot = "isems/command/" + device_id + "/reboot";
-  cmdDiagnostics = "isems/command/" + device_id + "/diagnostics";
   cmdInfo = "isems/command/" + device_id + "/info";
-  cmdLogs = "isems/command/" + device_id + "/logs";
 
-  logPrintln(" - Update: " + topicCmdUpdate);
-  logPrintln(" - Diagnostics: " + cmdDiagnostics);
-  logPrintln(" - Info: " + cmdInfo);
-  logPrintln(" - Reboot: " + cmdReboot);
-  logPrintln(" - Logs: " + cmdLogs);
+  Serial.Println(" - Update: " + topicCmdUpdate);
+  Serial.Println(" - Info: " + cmdInfo);
 }
 
 void dataSetServer(const char* host, uint16_t port, const String& user, const String& pass) {
@@ -349,7 +335,7 @@ static int32_t measureNetworkPingMs() {
 void dataPublishSetting() {
   // Pastikan MQTT connected
   if (!mqtt.connected()) {
-    logPrintln("[Data] MQTT not connected, cannot publish setting");
+    Serial.Println("[Data] MQTT not connected, cannot publish setting");
     return;
   }
 
@@ -357,7 +343,7 @@ void dataPublishSetting() {
     unsigned long now = millis();
     if (now - lastDeferredPublishLogMs >= 1000UL) {
       lastDeferredPublishLogMs = now;
-      logPrintf("[Data] Deferring setting publish until MQTT cooldown passes (%lu ms remaining)\n",
+      Serial.Printf("[Data] Deferring setting publish until MQTT cooldown passes (%lu ms remaining)\n",
                 MQTT_POST_CONNECT_PUBLISH_COOLDOWN_MS - (now - lastMqttConnectMs));
     }
     return;
@@ -365,63 +351,44 @@ void dataPublishSetting() {
   
   // Cek apakah topic sudah di-inisialisasi
   if (topicSetting.length() == 0) {
-    logPrintln("[Data] ERROR: topicSetting not initialized");
+    Serial.Println("[Data] ERROR: topicSetting not initialized");
     return;
   }
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<4096> doc;
   doc["automation"] = cfg.setting.automation;
-  doc["max_temp"] = cfg.setting.max_temp;
-  doc["min_temp"] = cfg.setting.min_temp;
-  doc["set_temp"] = cfg.setting.set_temp;
-  doc["set_mode"] = cfg.setting.set_mode;
-  doc["default_fan"] = cfg.setting.default_fan;
-  doc["temp_cooldown"] = cfg.setting.temp_control_cooldown_sec;
-  doc["auto_recovery"]   = cfg.setting.auto_recovery_sec;
-
-// 2. === LOGIKA STATUS AUTOMATION (PINDAHAN DARI TOPIC DATA) ===
-  String sysMode = "AUTO";
-  String pauseReason = "-";
-  int remainingSec = 0;
-
-  if (cfg.setting.manualModeActive) {
-    sysMode = "MANUAL_RECOVERY";
-    pauseReason = "MANUAL_OVERRIDE";
-    
-    // Hitung sisa waktu snapshot saat ini
-    unsigned long elapsed = millis() - cfg.setting.lastManualControlMs;
-    // Asumsi 3 menit (180000ms)
-    long rem = 180000UL - elapsed;
-    if (rem < 0) rem = 0;
-    remainingSec = rem / 1000;
-    
-  } else if (!cfg.setting.automation) {
-    sysMode = "OFF";
-    pauseReason = "USER_DISABLED";
-  } else {
-    sysMode = "AUTO";
-  }
-  // Masukkan ke JSON
-  doc["system_mode"] = sysMode;
-  doc["pause_reason"] = pauseReason;
-  // Kita kirim sisa waktu saat status ini berubah. 
-  // Dashboard bisa menggunakannya untuk countdown statis atau sekedar info.
-  doc["manual_remaining_s"] = remainingSec; 
 
   
   // ============================================================
-  JsonArray daily = doc.createNestedArray("daily");
+  JsonArray daily = doc.createNestedArray("schedule");
   for (int i = 0; i < 7; ++i) {
     JsonObject dayObj = daily.createNestedObject();
-    dayObj["day"] = DAY_NAMES[i];
-    if (cfg.setting.daily[i].type == DAY_PART_TIME) {
-      dayObj["type"] = "part_time";
-      JsonObject w = dayObj.createNestedObject("waktu");
-      w["mulai"] = cfg.setting.daily[i].waktu.mulai;
-      w["selesai"] = cfg.setting.daily[i].waktu.selesai;
-    } else if (cfg.setting.daily[i].type == DAY_LIBUR) {
-      dayObj["type"] = "libur";
+    dayObj["day"] = DAY_IDX_TO_NUM(i);
+    JsonArray data = dayObj.createNestedArray("data");
+    DaySchedule& d = cfg.setting.daily[i];
+    if (d.type == DAY_OFFTIME) {
+      dayObj["type"] = "offtime";
+    } else if (d.type == DAY_FULLTIME) {
+      dayObj["type"] = "fulltime";
+      JsonObject p = data.createNestedObject();
+      p["mode"] = d.periods[0].mode;
+      p["fan"] = d.periods[0].fan;
+      p["set_temp"] = d.periods[0].set_temp;
+      p["min_temp"] = d.periods[0].min_temp;
+      p["max_temp"] = d.periods[0].max_temp;
     } else {
-      dayObj["type"] = "full_time";
+      dayObj["type"] = "parttime";
+      uint8_t cnt = d.periodCount;
+      if (cnt > MAX_PERIODS_PER_DAY) cnt = MAX_PERIODS_PER_DAY;
+      for (uint8_t pIdx = 0; pIdx < cnt; pIdx++) {
+        JsonObject p = data.createNestedObject();
+        p["start"] = d.periods[pIdx].start;
+        p["end"] = d.periods[pIdx].end;
+        p["mode"] = d.periods[pIdx].mode;
+        p["fan"] = d.periods[pIdx].fan;
+        p["set_temp"] = d.periods[pIdx].set_temp;
+        p["min_temp"] = d.periods[pIdx].min_temp;
+        p["max_temp"] = d.periods[pIdx].max_temp;
+      }
     }
   }
 
@@ -450,73 +417,39 @@ void dataPublishSetting() {
   
   if (published) {
     consecutivePublishFails = 0;
-    logPrintf("[Data] ✓ Published setting successfully to: %s\n", topicSetting.c_str());
+    Serial.Printf("[Data] ✓ Published setting successfully to: %s\n", topicSetting.c_str());
   } else {
     consecutivePublishFails++;
-    logPrintf("[Data] ✗ Failed to publish setting to: %s (%d bytes, state=%d, fails=%d)\n", 
+    Serial.Printf("[Data] ✗ Failed to publish setting to: %s (%d bytes, state=%d, fails=%d)\n", 
               topicSetting.c_str(), payload.length(), mqtt.state(), consecutivePublishFails);
   }
 }
 
 void syncTime() {
   if (WiFi.status() != WL_CONNECTED) {
-    logPrintln("[Time] Skip NTP sync - WiFi not connected");
+    Serial.Println("[Time] Skip NTP sync - WiFi not connected");
     return;
   }
 
-  logPrintln("[Time] Requesting confirmed NTP sync...");
+  Serial.Println("[Time] Requesting confirmed NTP sync...");
   cfgSyncTime(5000);
 
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 250)) {
-    logPrintf("[Time] Current after sync attempt: %04d-%02d-%02d %02d:%02d:%02d\n",
+    Serial.Printf("[Time] Current after sync attempt: %04d-%02d-%02d %02d:%02d:%02d\n",
               timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
               timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
   } else {
-    logPrintln("[Time] Failed to read current time after sync attempt");
+    Serial.Println("[Time] Failed to read current time after sync attempt");
   }
 
   esp_task_wdt_reset();
   yield();
 }
 
-// Helper: format seconds ke format "Xh Ym Zs"
-static String formatDuration(unsigned long totalSeconds) {
-  unsigned long hours = totalSeconds / 3600;
-  unsigned long minutes = (totalSeconds % 3600) / 60;
-  unsigned long seconds = totalSeconds % 60;
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%luh %lum %lus", hours, minutes, seconds);
-  return String(buf);
-}
-
-// Helper: waktu WIB saat ini sebagai string
-static String getWibTimeString() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    return "unknown";
-  }
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d WIB",
-           timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-           timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-  return String(buf);
-}
-
-// Waktu WIB terakhir saat device benar-benar online (MQTT connected).
-// Diupdate setiap heartbeat dan sebelum graceful disconnect.
-static String lastOnlineWibStr = "unknown";
-
-// Disconnect timestamp & offline duration — di-reset setiap kali disconnect terjadi
-// agar reconnect berikutnya (dalam boot yang sama) reload dari file terbaru.
-static unsigned long bootDisconnectTimestamp = 0;
-static bool bootTsLoaded = false;
-static String cachedOfflineDuration = "";
-
 static void buildLwtPayload() {
   StaticJsonDocument<256> doc;
   doc["status"] = "offline";
-  doc["mqtt_log_enabled"] = logGetMqttEnabled();
   lwtPayload = "";
   serializeJson(doc, lwtPayload);
 }
@@ -524,18 +457,18 @@ static void buildLwtPayload() {
 // Fungsi helper untuk publish retained status payload
 static bool publishStatusRetainedPayload(const String& payload) {
   if (!mqtt.connected()) {
-    logPrintln("[Data] Cannot publish status - MQTT not connected");
+    Serial.Println("[Data] Cannot publish status - MQTT not connected");
     return false;
   }
   if (topicStatus.length() == 0) {
-    logPrintln("[Data] Cannot publish status - topicStatus is empty");
+    Serial.Println("[Data] Cannot publish status - topicStatus is empty");
     return false;
   }
 
   bool published = mqtt.publish(topicStatus.c_str(), payload.c_str(), true);
   if (!published) {
     consecutivePublishFails++;
-    logPrintf("[Data] Failed to publish retained status to: %s (fails=%d)\n", topicStatus.c_str(), consecutivePublishFails);
+    Serial.Printf("[Data] Failed to publish retained status to: %s (fails=%d)\n", topicStatus.c_str(), consecutivePublishFails);
     return false;
   }
 
@@ -547,11 +480,11 @@ static bool publishStatusRetainedPayload(const String& payload) {
 
 static bool publishDataRetainedPayload(const String& payload) {
   if (!mqtt.connected()) {
-    logPrintln("[Data] Cannot publish data - MQTT not connected");
+    Serial.Println("[Data] Cannot publish data - MQTT not connected");
     return false;
   }
   if (topicData.length() == 0) {
-    logPrintln("[Data] Cannot publish data - topicData is empty");
+    Serial.Println("[Data] Cannot publish data - topicData is empty");
     return false;
   }
 
@@ -565,7 +498,7 @@ static bool publishDataRetainedPayload(const String& payload) {
   }
   if (!ok) {
     consecutivePublishFails++;
-    logPrintf("[Data] Failed to publish retained data to: %s (len=%u, fails=%d)\n",
+    Serial.Printf("[Data] Failed to publish retained data to: %s (len=%u, fails=%d)\n",
               topicData.c_str(), static_cast<unsigned>(payloadLength), consecutivePublishFails);
     return false;
   }
@@ -581,74 +514,28 @@ void publishStatus(const String& status) {
   if (!mqtt.connected()) return;
 
   if (status == "online") {
-      StaticJsonDocument<512> doc;
-      
+      StaticJsonDocument<256> doc;
+
       doc["status"] = "online";
       doc["disconnect_reason"] = getDisconnectReasonStr(lastDisconnectReason);
-      
-      // Load disconnect timestamp sekali per boot (jika sudah di-cache, pakai nilai lama)
-      if (!bootTsLoaded) {
-        bootDisconnectTimestamp = cfgLoadDisconnectTimestamp();
-        bootTsLoaded = true;
-      }
-      unsigned long disconnectTimestamp = bootDisconnectTimestamp;
-      if (disconnectTimestamp > 1600000000UL) { // Timestamp valid (NTP synced)
-        // Konversi ke WIB string untuk last_disconnect
-        time_t ts = (time_t)disconnectTimestamp;
-        struct tm* tmInfo = localtime(&ts);
-        if (tmInfo) {
-          char wibBuf[32];
-          snprintf(wibBuf, sizeof(wibBuf), "%04d-%02d-%02d %02d:%02d:%02d WIB",
-                   tmInfo->tm_year + 1900, tmInfo->tm_mon + 1, tmInfo->tm_mday,
-                   tmInfo->tm_hour, tmInfo->tm_min, tmInfo->tm_sec);
-          doc["last_disconnect"] = wibBuf;
-        } else {
-          doc["last_disconnect"] = "unknown";
-        }
-        // Hitung durasi offline - di-cache agar tidak terus bertambah tiap heartbeat
-        if (cachedOfflineDuration.isEmpty()) {
-          unsigned long currentTimestamp = (unsigned long)time(nullptr);
-          if (currentTimestamp > 1600000000UL && currentTimestamp > disconnectTimestamp) {
-            unsigned long offlineSec = currentTimestamp - disconnectTimestamp;
-            cachedOfflineDuration = formatDuration(offlineSec);
-            logPrintf("[Data] Offline duration: %s (%lu seconds)\n", cachedOfflineDuration.c_str(), offlineSec);
-          } else {
-            cachedOfflineDuration = "0h 0m 0s";
-            logPrintln("[Data] Time not synced yet or invalid, offline duration = 0");
-          }
-        }
-        doc["offline_duration"] = cachedOfflineDuration;
-      } else {
-        doc["last_disconnect"] = "unknown";
-        doc["offline_duration"] = "0h 0m 0s";
-        if (disconnectTimestamp > 0) {
-          logPrintln("[Data] Invalid disconnect timestamp (pre-NTP), ignoring");
-        }
-      }
-      
-      doc["mqtt_log_enabled"] = logGetMqttEnabled();
 
       String payload;
       serializeJson(doc, payload);
       publishStatusRetainedPayload(payload);
-      
-      logPrintf("[Data] Status published: %s (Reason: %s)\n", 
+
+      Serial.Printf("[Data] Status published: %s (Reason: %s)\n",
                 status.c_str(), getDisconnectReasonStr(lastDisconnectReason).c_str());
   } 
   else if (status == "offline") {
       StaticJsonDocument<256> doc;
       doc["status"] = "offline";
       doc["reason"] = getDisconnectReasonStr(lastDisconnectReason);
-      doc["mqtt_log_enabled"] = logGetMqttEnabled();
       
       String payload;
       serializeJson(doc, payload);
       publishStatusRetainedPayload(payload);
       
-      // Simpan disconnect timestamp untuk perhitungan offline_duration berikutnya
-      cfgSaveDisconnectTimestamp();
-      
-      logPrintln("[Data] Offline status published");
+      Serial.Println("[Data] Offline status published");
   }
   else {
       // Status lain (rebooting, updating, etc.)
@@ -687,7 +574,7 @@ unsigned long getRetryInterval() {
 
 static void resetMqttRc2RecoveryState(const char* reason = nullptr) {
   if (mqttRc2FirstFailMs != 0 && reason && reason[0] != '\0') {
-    logPrintf("[MQTT] RC -2 recovery reset: %s\n", reason);
+    Serial.Printf("[MQTT] RC -2 recovery reset: %s\n", reason);
   }
   mqttRc2ConsecutiveFails = 0;
   mqttRc2FirstFailMs = 0;
@@ -703,7 +590,7 @@ static void noteMqttRc2Failure() {
   if (mqttRc2ConsecutiveFails < 255) {
     mqttRc2ConsecutiveFails++;
   }
-  logPrintf("[MQTT] RC -2 tracker: fails=%u, stuck=%lu sec, wifi_recovery=%s\n",
+  Serial.Printf("[MQTT] RC -2 tracker: fails=%u, stuck=%lu sec, wifi_recovery=%s\n",
             mqttRc2ConsecutiveFails,
             (now - mqttRc2FirstFailMs) / 1000UL,
             mqttRc2WifiRecoveryAttempted ? "done" : "pending");
@@ -714,7 +601,7 @@ static void performMqttRc2WifiRecovery() {
   mqttRc2WifiRecoveryAttempted = true;
   lastDisconnectReason = REASON_MQTT_LOST;
 
-  logPrintln("[MQTT] RC -2 persisted - resetting WiFi radio + TLS stack...");
+  Serial.Println("[MQTT] RC -2 persisted - resetting WiFi radio + TLS stack...");
   dataResetConnection();
 
   cfg.koneksi.wifi_ssid.trim();
@@ -738,7 +625,7 @@ static void performMqttRc2WifiRecovery() {
 
   lastMqttRetryMs = 0;
   mqttRetryAttempt = 0;
-  logPrintln("[MQTT] RC -2 WiFi/TLS recovery triggered");
+  Serial.Println("[MQTT] RC -2 WiFi/TLS recovery triggered");
 }
 
 static void maybeEscalateMqttRc2Failure() {
@@ -757,7 +644,7 @@ static void maybeEscalateMqttRc2Failure() {
   if (mqttRc2WifiRecoveryAttempted &&
       now - mqttRc2FirstFailMs >= MQTT_RC2_RESTART_AFTER_MS &&
       now - lastMqttRc2RecoveryMs >= MQTT_RC2_RECOVERY_COOLDOWN_MS) {
-    logPrintf("[MQTT] RC -2 persisted for %lu sec after WiFi/TLS recovery - restarting ESP32...\n",
+    Serial.Printf("[MQTT] RC -2 persisted for %lu sec after WiFi/TLS recovery - restarting ESP32...\n",
               (now - mqttRc2FirstFailMs) / 1000UL);
     lastDisconnectReason = REASON_MQTT_LOST;
     delay(200);
@@ -772,13 +659,13 @@ static void ensureMqttConnected() {
   static bool offlineNotifyDone = false;
 
   if (WiFi.status() != WL_CONNECTED) {
-    logPrintln("[MQTT] WiFi not connected, skip MQTT connection");
+    Serial.Println("[MQTT] WiFi not connected, skip MQTT connection");
     return;
   }
   WiFi.setSleep(false);
 
   if (cfg.device_id.length() == 0) {
-    logPrintln("[MQTT] ERROR: device_id is empty - cannot build topics/connect");
+    Serial.Println("[MQTT] ERROR: device_id is empty - cannot build topics/connect");
     return;
   }
   
@@ -789,7 +676,7 @@ static void ensureMqttConnected() {
   
   // Pastikan topics diinisialisasi
   if (topicStatus.length() == 0 || topicData.length() == 0) {
-    logPrintln("[MQTT] Topics not initialized, initializing now...");
+    Serial.Println("[MQTT] Topics not initialized, initializing now...");
     dataBuildTopics(cfg.device_id);
     dataSetServer(cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port, 
                   cfg.koneksi.mqtt_user, cfg.koneksi.mqtt_pass);
@@ -804,7 +691,7 @@ static void ensureMqttConnected() {
     static unsigned long lastLogMs = 0;
     if (now - lastLogMs >= 30000) {
       unsigned long remainingMs = retryInterval - (now - lastMqttRetryMs);
-      logPrintf("[MQTT] Waiting %lu seconds before retry (attempt %d/%d)\n", 
+      Serial.Printf("[MQTT] Waiting %lu seconds before retry (attempt %d/%d)\n", 
                 remainingMs / 1000, mqttRetryAttempt + 1, MAX_RETRY_ATTEMPTS);
       lastLogMs = now;
     }
@@ -819,11 +706,11 @@ static void ensureMqttConnected() {
   delay(100);
   yield();
   
-  logPrintln("[MQTT] mencoba konek ke server...");
-  logPrintf("[MQTT] Server: %s:%d (SSL)\n", cfg.koneksi.mqtt_host.c_str(), 
+  Serial.Println("[MQTT] mencoba konek ke server...");
+  Serial.Printf("[MQTT] Server: %s:%d (SSL)\n", cfg.koneksi.mqtt_host.c_str(), 
             cfg.koneksi.mqtt_port);
-  logPrintf("[MQTT] Client ID: %s\n", cfg.device_id.c_str());
-  logPrintf("[MQTT] Retry attempt: %d/%d\n", mqttRetryAttempt, MAX_RETRY_ATTEMPTS);
+  Serial.Printf("[MQTT] Client ID: %s\n", cfg.device_id.c_str());
+  Serial.Printf("[MQTT] Retry attempt: %d/%d\n", mqttRetryAttempt, MAX_RETRY_ATTEMPTS);
   
   esp_task_wdt_reset();
   yield();
@@ -832,25 +719,6 @@ static void ensureMqttConnected() {
   bool ok;
   const char* clientId = cfg.device_id.c_str();
   unsigned long connectStart = millis();
-  
-  // Restore lastOnlineWibStr dari epoch tersimpan di LittleFS (sekali saat boot).
-  // Tanpa ini, LWT dan corrected offline akan punya last_online = "unknown" atau
-  // waktu saat connect (bukan waktu terakhir device benar-benar online).
-  if (!bootTsLoaded) {
-    bootDisconnectTimestamp = cfgLoadDisconnectTimestamp();
-    bootTsLoaded = true;
-    if (bootDisconnectTimestamp > 1600000000UL) {
-      time_t t = (time_t)bootDisconnectTimestamp;
-      struct tm* tmInfo = localtime(&t);
-      if (tmInfo) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d WIB",
-                 tmInfo->tm_year + 1900, tmInfo->tm_mon + 1, tmInfo->tm_mday,
-                 tmInfo->tm_hour, tmInfo->tm_min, tmInfo->tm_sec);
-        lastOnlineWibStr = buf;
-      }
-    }
-  }
   
   buildLwtPayload();
   if (mqttUser.length()) {
@@ -861,13 +729,13 @@ static void ensureMqttConnected() {
   }
   
   unsigned long connectDuration = millis() - connectStart;
-  logPrintf("[MQTT] Connection attempt took %lu ms\n", connectDuration);
+  Serial.Printf("[MQTT] Connection attempt took %lu ms\n", connectDuration);
 
   // Deteksi SSL heap exhaustion: jika connect() return < 5ms,
   // berarti tidak ada koneksi yang benar-benar dicoba (mbedTLS gagal alokasi heap).
   if (!ok && connectDuration < 5) {
-    logPrintf("[MQTT] ✗ SSL instant-fail (0ms) - Free heap: %u bytes\n", ESP.getFreeHeap());
-    logPrintln("[MQTT] Kemungkinan heap exhausted. Auto-restart dalam 3 detik...");
+    Serial.Printf("[MQTT] ✗ SSL instant-fail (0ms) - Free heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.Println("[MQTT] Kemungkinan heap exhausted. Auto-restart dalam 3 detik...");
     delay(3000);
     ESP.restart();
   }
@@ -882,13 +750,13 @@ static void ensureMqttConnected() {
     
     if (isManualDisconnect) {
       isManualDisconnect = false;
-      logPrintln("[MQTT] Reconnected after config save (Counter ignored)");
+      Serial.Println("[MQTT] Reconnected after config save (Counter ignored)");
     } else {
       mqttReconnectCount++;
-      logPrintf("[MQTT] Reconnect Count: %lu\n", mqttReconnectCount);
+      Serial.Printf("[MQTT] Reconnect Count: %lu\n", mqttReconnectCount);
     }
     
-    logPrintln("[MQTT] ✓ Connected successfully!");
+    Serial.Println("[MQTT] ✓ Connected successfully!");
     lastMqttConnectMs = millis(); // Catat waktu connect untuk cooldown guard
     offlineNotifyDone = false; // Reset agar bisa notify kembali jika nanti disconnect lagi
 
@@ -898,7 +766,6 @@ static void ensureMqttConnected() {
       StaticJsonDocument<256> offDoc;
       offDoc["status"] = "offline";
       offDoc["reason"] = getDisconnectReasonStr(lastDisconnectReason);
-      offDoc["mqtt_log_enabled"] = logGetMqttEnabled();
       String offPayload;
       serializeJson(offDoc, offPayload);
       publishStatusRetainedPayload(offPayload);
@@ -911,20 +778,19 @@ static void ensureMqttConnected() {
     yield();
     
     // Subscribe to all command topics (log failures so it isn't silent)
-    if (!mqtt.subscribe(cmdSetting.c_str()))     logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdSetting.c_str());
-    if (!mqtt.subscribe(cmdKoneksi.c_str()))     logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdKoneksi.c_str());
-    if (!mqtt.subscribe(cmdSchedule.c_str()))    logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdSchedule.c_str());
-    if (!mqtt.subscribe(cmdRemote.c_str()))      logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdRemote.c_str());
+    if (!mqtt.subscribe(cmdSetting.c_str()))     Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdSetting.c_str());
+    if (!mqtt.subscribe(cmdKoneksi.c_str()))     Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdKoneksi.c_str());
+    if (!mqtt.subscribe(cmdSchedule.c_str()))    Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdSchedule.c_str());
+    if (!mqtt.subscribe(cmdRemote.c_str()))      Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdRemote.c_str());
     if (topicCmdUpdate.length() > 0) {
-      if (!mqtt.subscribe(topicCmdUpdate.c_str())) logPrintf("[MQTT] ✗ Subscribe failed: %s\n", topicCmdUpdate.c_str());
+      if (!mqtt.subscribe(topicCmdUpdate.c_str())) Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", topicCmdUpdate.c_str());
     } else {
-      logPrintln("[MQTT] Skip subscribe: topicCmdUpdate empty");
+      Serial.Println("[MQTT] Skip subscribe: topicCmdUpdate empty");
     }
-    if (!mqtt.subscribe(cmdDiagnostics.c_str())) logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdDiagnostics.c_str());
-    if (!mqtt.subscribe(cmdInfo.c_str()))        logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdInfo.c_str());
-    if (!mqtt.subscribe(cmdReboot.c_str()))      logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdReboot.c_str());
-    if (!mqtt.subscribe(cmdLogs.c_str()))        logPrintf("[MQTT] ✗ Subscribe failed: %s\n", cmdLogs.c_str());
-    logPrintln("[MQTT] Subscribed to command topics");
+
+    if (!mqtt.subscribe(cmdInfo.c_str()))        Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdInfo.c_str());
+    if (!mqtt.subscribe(cmdReboot.c_str()))      Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdReboot.c_str());
+    Serial.Println("[MQTT] Subscribed to command topics");
     
     esp_task_wdt_reset();
     yield();
@@ -932,7 +798,7 @@ static void ensureMqttConnected() {
     // Publish setting ditunda sampai post-connect cooldown terlewati.
   } else {
     int rc = mqtt.state();
-    logPrintf("[MQTT] ✗ Gagal konek, rc=%d (", rc);
+    Serial.Printf("[MQTT] ✗ Gagal konek, rc=%d (", rc);
     switch(rc) {
       case -4: Serial.print("Timeout - server tidak merespons"); break;
       case -3: Serial.print("Connection lost"); break;
@@ -945,7 +811,7 @@ static void ensureMqttConnected() {
       case 5: Serial.print("Unauthorized"); break;
       default: Serial.print("Unknown error");
     }
-    logPrintln(")");
+    Serial.Println(")");
 
     if (rc == -2) {
       noteMqttRc2Failure();
@@ -956,13 +822,13 @@ static void ensureMqttConnected() {
     
     // Log next retry time
     unsigned long nextRetryMs = getRetryInterval();
-    logPrintf("[MQTT] Next retry in %lu seconds (attempt %d/%d)\n", 
+    Serial.Printf("[MQTT] Next retry in %lu seconds (attempt %d/%d)\n", 
               nextRetryMs / 1000, mqttRetryAttempt + 1, MAX_RETRY_ATTEMPTS);
 
     // Setelah 3 retry gagal & WiFi masih terhubung, publish retained offline sekali
     // agar dashboard langsung tahu device offline tanpa menunggu LWT broker.
     if (mqttRetryAttempt >= 3 && !offlineNotifyDone && WiFi.status() == WL_CONNECTED) {
-      logPrintln("[MQTT] 3 retry gagal - mencoba publish status offline...");
+      Serial.Println("[MQTT] 3 retry gagal - mencoba publish status offline...");
       lastDisconnectReason = REASON_MQTT_LOST;
       espClient.stop();
       yield();
@@ -979,9 +845,9 @@ static void ensureMqttConnected() {
         delay(100);
         mqtt.disconnect();
         espClient.stop();
-        logPrintln("[MQTT] ✓ Status offline berhasil dipublish setelah 3 retry gagal");
+        Serial.Println("[MQTT] ✓ Status offline berhasil dipublish setelah 3 retry gagal");
       } else {
-        logPrintln("[MQTT] ✗ Offline notify gagal - broker tidak terjangkau, LWT akan aktif");
+        Serial.Println("[MQTT] ✗ Offline notify gagal - broker tidak terjangkau, LWT akan aktif");
       }
       offlineNotifyDone = true;
     }
@@ -1000,10 +866,10 @@ void dataInit() {
   // HAPUS atau KOMENTARI baris ini: espClient.setInsecure();
   
   if (PROD_ROOT_CA != NULL) {
-      logPrintln("[Data] Setting Secure Root CA Certificate...");
+      Serial.Println("[Data] Setting Secure Root CA Certificate...");
       espClient.setCACert(PROD_ROOT_CA); // Menggunakan sertifikat dari config.h
   } else {
-      logPrintln("[Data] WARNING: Root CA is NULL! Fallback to Insecure.");
+      Serial.Println("[Data] WARNING: Root CA is NULL! Fallback to Insecure.");
       espClient.setInsecure();
   }
   
@@ -1025,22 +891,22 @@ void dataInit() {
   esp_reset_reason_t r = esp_reset_reason();
   if (r == ESP_RST_WDT || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT) {
       lastDisconnectReason = REASON_WDT_RESET;
-      logPrintln("[Data] Disconnect reason: WATCHDOG RESET");
+      Serial.Println("[Data] Disconnect reason: WATCHDOG RESET");
   } else if (r == ESP_RST_BROWNOUT) {
       lastDisconnectReason = REASON_POWER_LOSS;
-      logPrintln("[Data] Disconnect reason: POWER LOSS (brownout detected)");
+      Serial.Println("[Data] Disconnect reason: POWER LOSS (brownout detected)");
   } else if (r == ESP_RST_PANIC) {
       lastDisconnectReason = REASON_CRASH;
-      logPrintln("[Data] Disconnect reason: SOFTWARE CRASH (panic)");
+      Serial.Println("[Data] Disconnect reason: SOFTWARE CRASH (panic)");
   } else if (r == ESP_RST_POWERON) {
       lastDisconnectReason = REASON_POWER_ON;
-      logPrintln("[Data] Disconnect reason: POWER ON / POWER CYCLE");
+      Serial.Println("[Data] Disconnect reason: POWER ON / POWER CYCLE");
   } else if (r == ESP_RST_SW) {
       lastDisconnectReason = REASON_POWER_ON;
-      logPrintln("[Data] Disconnect reason: SOFTWARE RESET (OTA/command)");
+      Serial.Println("[Data] Disconnect reason: SOFTWARE RESET (OTA/command)");
   } else {
       lastDisconnectReason = REASON_POWER_ON;
-      logPrintf("[Data] Disconnect reason: UNKNOWN (esp_reset_reason=%d)\n", (int)r);
+      Serial.Printf("[Data] Disconnect reason: UNKNOWN (esp_reset_reason=%d)\n", (int)r);
   }
   
   // Reset retry timer agar koneksi bisa langsung dicoba
@@ -1052,15 +918,15 @@ void dataInit() {
     dataSetServer(cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port, 
                   cfg.koneksi.mqtt_user, cfg.koneksi.mqtt_pass);
                   
-    logPrintf("[Data] MQTT topics built for device: %s\n", cfg.device_id.c_str());
+    Serial.Printf("[Data] MQTT topics built for device: %s\n", cfg.device_id.c_str());
   }
   
   // 6. Setup logger MQTT publisher
-  logSetMqttPublisher(publishLogs);
-  logPrintln("[Data] Logger MQTT publisher configured");
   
-  logPrintln("[Data] MQTT Config: Buffer=4096, KeepAlive=30s, Timeout=15s");
-  logPrintf("[Data] MQTT Server: %s:%d (SECURE)\n", cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port);
+  Serial.Println("[Data] Logger MQTT publisher configured");
+  
+  Serial.Println("[Data] MQTT Config: Buffer=4096, KeepAlive=30s, Timeout=15s");
+  Serial.Printf("[Data] MQTT Server: %s:%d (SECURE)\n", cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port);
 
   extern void activityBuildTopic(const String&);
   activityBuildTopic(cfg.device_id);
@@ -1083,34 +949,12 @@ void dataLoop() {
 
   if (WiFi.status() != WL_CONNECTED) {
     resetMqttRc2RecoveryState("wifi disconnected");
-    // Gunakan epoch dari WiFi event handler jika tersedia (lebih akurat).
-    unsigned long disconnectEpoch = wifiDisconnectEpoch;
-    if (disconnectEpoch > 1600000000UL) {
-      wifiDisconnectEpoch = 0; // Konsumsi flag
-      // Update lastOnlineWibStr dengan waktu tepat saat WiFi disconnect
-      time_t t = (time_t)disconnectEpoch;
-      struct tm* tmInfo = localtime(&t);
-      if (tmInfo) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d WIB",
-                 tmInfo->tm_year + 1900, tmInfo->tm_mon + 1, tmInfo->tm_mday,
-                 tmInfo->tm_hour, tmInfo->tm_min, tmInfo->tm_sec);
-        lastOnlineWibStr = buf;
-      }
-    }
     if (mqtt.connected()) {
       // Do NOT send MQTT DISCONNECT here.
       // Forcing socket close is more reliable for LWT/offline propagation.
-      cfgSaveDisconnectTimestamp(disconnectEpoch > 1600000000UL ? disconnectEpoch : 0);
       espClient.stop();
-      // Reset cache agar reconnect berikutnya reload timestamp terbaru
-      bootTsLoaded = false;
-      cachedOfflineDuration = "";
     } else if (wasMqttConnected) {
       // mqtt.connected() sudah false (TCP RST), tapi kita belum sempat save
-      cfgSaveDisconnectTimestamp(disconnectEpoch > 1600000000UL ? disconnectEpoch : 0);
-      bootTsLoaded = false;
-      cachedOfflineDuration = "";
     }
     wasMqttConnected = false;
     return;
@@ -1119,14 +963,7 @@ void dataLoop() {
   serviceNearbyWifiScan();
   
   if (!mqtt.connected()) {
-    // Simpan disconnect timestamp sekali saat MQTT terdeteksi offline
     if (wasMqttConnected) {
-      if (!isManualDisconnect) {
-        // Hanya simpan & reset cache untuk disconnect sesungguhnya
-        cfgSaveDisconnectTimestamp();
-        bootTsLoaded = false;
-        cachedOfflineDuration = "";
-      }
       wasMqttConnected = false;
     }
     ensureMqttConnected();
@@ -1150,7 +987,7 @@ void dataLoop() {
   // Zombie connection detection: MQTT reports connected tapi publish terus gagal.
   // Ini terjadi saat SSL layer rusak tapi TCP masih "connected".
   if (consecutivePublishFails >= 3) {
-    logPrintln("[MQTT] \u2717 Zombie connection detected (3+ publish fails) \u2014 forcing clean reconnect");
+    Serial.Println("[MQTT] \u2717 Zombie connection detected (3+ publish fails) \u2014 forcing clean reconnect");
     consecutivePublishFails = 0;
     mqtt.disconnect();
     espClient.stop();
@@ -1173,14 +1010,11 @@ void dataLoop() {
     }
   }
 
-  // Heartbeat: simpan timestamp periodik setiap 30 detik selama connected.
-  // Jika device mati mendadak (power loss), timestamp terakhir tetap tersimpan
-  // sehingga offline_duration bisa dihitung saat device hidup kembali.
+  // Heartbeat
   unsigned long now = millis();
 
   if (now - lastHeartbeatMs >= 120000UL) { // 2 menit
     lastHeartbeatMs = now;
-    cfgSaveLastAlive(); // checkpoint power loss - file terpisah, tidak timpa disconnect_ts
     publishStatus("online"); // refresh retained online payload
 
     // Refresh LWT payload setiap 4 heartbeat (2 menit).
@@ -1189,22 +1023,17 @@ void dataLoop() {
     lwtRefreshCounter++;
     if (lwtRefreshCounter >= 6) {
       lwtRefreshCounter = 0;
-      lastOnlineWibStr = getWibTimeString();
       buildLwtPayload(); // Update LWT payload di memory untuk reconnect berikutnya
       publishStatus("online"); // Refresh retained status di broker
-      logPrintln("[MQTT] LWT payload updated + status refreshed");
+      Serial.Println("[MQTT] LWT payload updated + status refreshed");
     }
   }
-  // Selalu update waktu terakhir online selama connected,
-  // agar publishStatus("offline") menampilkan waktu yang akurat.
-  lastOnlineWibStr = getWibTimeString();
 }
 
 void dataDisconnect() {
   if (mqtt.connected()) {
     // For graceful disconnect, send offline status manually
-    logPrintln("[MQTT] Sending offline status before graceful disconnect...");
-    lastOnlineWibStr = getWibTimeString(); // Update tepat sebelum disconnect
+    Serial.Println("[MQTT] Sending offline status before graceful disconnect...");
     publishStatus("offline");
     delay(100); // Give time for message to be sent
     mqtt.disconnect();
@@ -1217,12 +1046,12 @@ void dataDisconnect() {
       if (f) {
         f.println("graceful");
         f.close();
-        logPrintln("[MQTT] Graceful shutdown flag created");
+        Serial.Println("[MQTT] Graceful shutdown flag created");
       }
       LittleFS.remove("/running.flag");
     }
     
-    logPrintln("[MQTT] Disconnected gracefully");
+    Serial.Println("[MQTT] Disconnected gracefully");
   }
 }
 
@@ -1236,7 +1065,7 @@ void dataNotifyOffline() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (topicStatus.length() == 0) return;
   if (mqtt.connected()) return; // Masih connected, tidak perlu notify
-  logPrintln("[MQTT] Mempublish status offline (retry gagal 3x)...");
+  Serial.Println("[MQTT] Mempublish status offline (retry gagal 3x)...");
   espClient.stop();
   yield();
   bool ok;
@@ -1253,21 +1082,18 @@ void dataNotifyOffline() {
     delay(100);
     mqtt.disconnect();
     espClient.stop();
-    logPrintln("[MQTT] \u2713 Status offline berhasil dipublish");
+    Serial.Println("[MQTT] \u2713 Status offline berhasil dipublish");
   } else {
-    logPrintln("[MQTT] \u2717 Offline notify gagal - broker tidak terjangkau");
+    Serial.Println("[MQTT] \u2717 Offline notify gagal - broker tidak terjangkau");
   }
 }
 
 void dataResetConnection() {
   // Reset SSL client dan disconnect MQTT untuk memaksa fresh connection
-  logPrintln("[MQTT] Resetting connection (WiFi reconnected)...");
+  Serial.Println("[MQTT] Resetting connection (WiFi reconnected)...");
   
   if (mqtt.connected()) {
-    // Jangan publish "offline" di sini — cfgSaveDisconnectTimestamp() di dalam
-    // publishStatus("offline") akan menimpa timestamp disconnect asli dengan waktu
-    // reconnect, membuat offline_duration menjadi hanya ~3 detik.
-    // LWT (broker-side) sudah menangani retained offline status.
+    // Jangan publish "offline" di sini — LWT (broker-side) sudah menangani retained offline status.
     mqtt.disconnect();
   }
   
@@ -1286,24 +1112,24 @@ void dataResetConnection() {
   lastMqttRetryMs = 0;
   mqttInitialized = false;
   
-  logPrintln("[MQTT] Connection reset complete, ready for fresh connection");
+  Serial.Println("[MQTT] Connection reset complete, ready for fresh connection");
 }
 
 void dataForceConnect() {
   // Cek WiFi terlebih dahulu
   if (WiFi.status() != WL_CONNECTED) {
-    logPrintln("[MQTT] WiFi not connected, cannot force connect");
+    Serial.Println("[MQTT] WiFi not connected, cannot force connect");
     return;
   }
   
   if (mqtt.connected()) {
-    logPrintln("[MQTT] Already connected");
+    Serial.Println("[MQTT] Already connected");
     return;
   }
   
   // Pastikan topics sudah diinisialisasi
   if (topicStatus.length() == 0) {
-    logPrintln("[MQTT] Initializing topics before connection...");
+    Serial.Println("[MQTT] Initializing topics before connection...");
     dataBuildTopics(cfg.device_id);
     dataSetServer(cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port, 
                   cfg.koneksi.mqtt_user, cfg.koneksi.mqtt_pass);
@@ -1315,9 +1141,9 @@ void dataForceConnect() {
   yield();
   
   // Bypass cooldown untuk force connection
-  logPrintln("[MQTT] Force connecting to server...");
-  logPrintf("[MQTT] Server: %s:%d (SSL)\n", cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port);
-  logPrintf("[MQTT] Client ID: %s\n", cfg.device_id.c_str());
+  Serial.Println("[MQTT] Force connecting to server...");
+  Serial.Printf("[MQTT] Server: %s:%d (SSL)\n", cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port);
+  Serial.Printf("[MQTT] Client ID: %s\n", cfg.device_id.c_str());
   esp_task_wdt_reset();
   yield();
   
@@ -1336,13 +1162,13 @@ void dataForceConnect() {
   }
   
   unsigned long connectDuration = millis() - connectStart;
-  logPrintf("[MQTT] Connection attempt took %lu ms\n", connectDuration);
+  Serial.Printf("[MQTT] Connection attempt took %lu ms\n", connectDuration);
 
   // Deteksi SSL heap exhaustion: jika connect() return < 5ms,
   // berarti tidak ada koneksi yang benar-benar dicoba (mbedTLS gagal alokasi heap).
   if (!ok && connectDuration < 5) {
-    logPrintf("[MQTT] ✗ SSL instant-fail (0ms) - Free heap: %u bytes\n", ESP.getFreeHeap());
-    logPrintln("[MQTT] Kemungkinan heap exhausted. Auto-restart dalam 3 detik...");
+    Serial.Printf("[MQTT] ✗ SSL instant-fail (0ms) - Free heap: %u bytes\n", ESP.getFreeHeap());
+    Serial.Println("[MQTT] Kemungkinan heap exhausted. Auto-restart dalam 3 detik...");
     delay(3000);
     ESP.restart();
   }
@@ -1356,15 +1182,15 @@ void dataForceConnect() {
     if (isManualDisconnect) {
       // Jika reconnect setelah save config, reset flag & jangan hitung sebagai error
       isManualDisconnect = false;
-      logPrintln("[MQTT] Reconnected after config save (Counter ignored)");
+      Serial.Println("[MQTT] Reconnected after config save (Counter ignored)");
     } else {
       // Murni putus jaringan -> Tambah counter
       mqttReconnectCount++;
-      logPrintf("[MQTT] Reconnect Count: %lu\n", mqttReconnectCount);
+      Serial.Printf("[MQTT] Reconnect Count: %lu\n", mqttReconnectCount);
     }
     // ============================================
 
-    logPrintln("[MQTT] Force connect successful!");
+    Serial.Println("[MQTT] Force connect successful!");
     lastMqttConnectMs = millis(); // Catat waktu connect untuk cooldown guard
     publishStatus("online");
     
@@ -1382,7 +1208,7 @@ void dataForceConnect() {
     mqtt.subscribe(cmdSchedule.c_str());
     mqtt.subscribe(cmdRemote.c_str());
     mqtt.subscribe(cmdReboot.c_str());
-    mqtt.subscribe(cmdDiagnostics.c_str());
+
     mqtt.subscribe(cmdInfo.c_str());
     
     // === [MODIFIKASI 3] Wajib Subscribe Topik OTA ===
@@ -1391,7 +1217,7 @@ void dataForceConnect() {
     }
     // ================================================
     
-    logPrintln("[MQTT] Subscribed to command topics");
+    Serial.Println("[MQTT] Subscribed to command topics");
     
     esp_task_wdt_reset();
     yield();
@@ -1408,7 +1234,7 @@ void dataForceConnect() {
     }
   } else {
     int rc = mqtt.state();
-    logPrintf("[MQTT] ✗ Force connect failed, rc=%d (", rc);
+    Serial.Printf("[MQTT] ✗ Force connect failed, rc=%d (", rc);
     switch(rc) {
       case -4: Serial.print("Timeout - server tidak merespons"); break;
       case -3: Serial.print("Connection lost"); break;
@@ -1421,7 +1247,7 @@ void dataForceConnect() {
       case 5: Serial.print("Unauthorized"); break;
       default: Serial.print("Unknown error");
     }
-    logPrintln(")");
+    Serial.Println(")");
     if (rc == -2) {
       noteMqttRc2Failure();
       maybeEscalateMqttRc2Failure();
@@ -1512,7 +1338,7 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok) {
   serializeJson(doc, payload);
 
   if (!mqtt.connected() || topicData.length() == 0) {
-    logPrintln("[Data] Skip publish (MQTT not connected / topicData empty)");
+    Serial.Println("[Data] Skip publish (MQTT not connected / topicData empty)");
     return;
   }
 
@@ -1530,9 +1356,9 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok) {
     ok = publishDataRetainedPayload(payload);
   }
   if (ok) {
-    logPrintln("[Data] Published suhu + status sistem ke MQTT");
+    Serial.Println("[Data] Published suhu + status sistem ke MQTT");
   } else {
-    logPrintf("[Data] ✗ Publish failed (state=%d)\n", mqtt.state());
+    Serial.Printf("[Data] ✗ Publish failed (state=%d)\n", mqtt.state());
   }
 }
 
@@ -1541,9 +1367,9 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok) {
 // jika user manually enable automation via MQTT
 // ============================================================
 static void handleCmdSetting(const char* payload, unsigned int length) {
-  logPrintln("[CMD Setting] ========== START ==========");
+  Serial.Println("[CMD Setting] ========== START ==========");
   if (length > 2048) {
-    logPrintln("[CMD Setting] Payload too large");
+    Serial.Println("[CMD Setting] Payload too large");
     return;
   }
   
@@ -1552,7 +1378,7 @@ static void handleCmdSetting(const char* payload, unsigned int length) {
   if (err) {
     Serial.print("[CMD Setting] JSON error: ");
     dataPublishAck("setting", "failed", "Invalid JSON format");
-    logPrintln(err.c_str());
+    Serial.Println(err.c_str());
     return;
   }
 
@@ -1561,7 +1387,7 @@ static void handleCmdSetting(const char* payload, unsigned int length) {
   // Immutable keys - reject any attempt to modify
   if (doc.containsKey("device_id") || doc.containsKey("ac_brand")) {
     dataPublishAck("setting", "failed", "Immutable field (device_id/ac_brand) cannot be changed");
-    logPrintln("[CMD Setting] ERROR: Attempt to modify immutable field");
+    Serial.Println("[CMD Setting] ERROR: Attempt to modify immutable field");
     return;
   }
   
@@ -1570,7 +1396,7 @@ static void handleCmdSetting(const char* payload, unsigned int length) {
     JsonVariant autoValue = doc["automation"];
 
     if (!autoValue.is<bool>()) {
-      logPrintln("[CMD Setting] ERROR: automation must be boolean (true/false)");
+      Serial.Println("[CMD Setting] ERROR: automation must be boolean (true/false)");
       return;
     }
 
@@ -1582,26 +1408,26 @@ static void handleCmdSetting(const char* payload, unsigned int length) {
 
       if (newAutoValue) {
         // === USER MENGHIDUPKAN AUTOMATION ===
-        logPrintln("[CMD Setting] Automation enabled by user");
+        Serial.Println("[CMD Setting] Automation enabled by user");
 
         cfg.setting.automationPausedByUser = false;
 
         // Clear manual recovery jika ada
         if (cfg.setting.manualModeActive) {
-          logPrintln("[CMD Setting] Clearing manual mode (user override)");
+          Serial.Println("[CMD Setting] Clearing manual mode (user override)");
           cfg.setting.manualModeActive = false;
           cfg.setting.lastManualControlMs = millis();
         }
 
       } else {
         // === USER MEMATIKAN AUTOMATION ===
-        logPrintln("[CMD Setting] Automation disabled by user");
+        Serial.Println("[CMD Setting] Automation disabled by user");
 
         cfg.setting.automationPausedByUser = true;
         cfg.setting.manualModeActive = false;
       }
 
-      logPrintf(
+      Serial.Printf(
         "[CMD Setting] Automation changed to: %s\n",
         cfg.setting.automation ? "true" : "false"
       );
@@ -1609,180 +1435,51 @@ static void handleCmdSetting(const char* payload, unsigned int length) {
       changed = true;
     }
   }
-  // ... rest of validation code (max_temp, min_temp, set_temp, set_mode) ...
-  // [COPY DARI KODE ASLI ANDA]
-  
-  if (doc.containsKey("max_temp")) {
-    JsonVariant maxTempValue = doc["max_temp"];
-    if (maxTempValue.is<int>()) {
-      int maxTemp = maxTempValue.as<int>();
-      if (maxTemp <= 30) {
-        cfg.setting.max_temp = maxTemp;
-        logPrintf("[CMD Setting] Max temp changed to: %d\n", cfg.setting.max_temp);
-        changed = true;
-      } else {
-        logPrintf("[CMD Setting] ERROR: max_temp must be <= 30, got: %d\n", maxTemp);
-      }
-    } else {
-      logPrintln("[CMD Setting] ERROR: max_temp must be a number");
-    }
-  }
-  
-  if (doc.containsKey("min_temp")) {
-    JsonVariant minTempValue = doc["min_temp"];
-    if (minTempValue.is<int>()) {
-      int minTemp = minTempValue.as<int>();
-      if (minTemp >= 16) {
-        cfg.setting.min_temp = minTemp;
-        logPrintf("[CMD Setting] Min temp changed to: %d\n", cfg.setting.min_temp);
-        changed = true;
-      } else {
-        logPrintf("[CMD Setting] ERROR: min_temp must be >= 16, got: %d\n", minTemp);
-      }
-    } else {
-      logPrintln("[CMD Setting] ERROR: min_temp must be a number");
-    }
-  }
-  
-  if (doc.containsKey("set_temp")) {
-    JsonVariant setTempValue = doc["set_temp"];
-    if (setTempValue.is<int>()) {
-      int setTemp = setTempValue.as<int>();
-      if (setTemp >= 16 && setTemp <= 30) {
-        cfg.setting.set_temp = setTemp;
-        logPrintf("[CMD Setting] Set temp changed to: %d\n", cfg.setting.set_temp);
-        changed = true;
-      } else {
-        logPrintf("[CMD Setting] ERROR: set_temp must be 16-30, got: %d\n", setTemp);
-      }
-    } else {
-      logPrintln("[CMD Setting] ERROR: set_temp must be a number");
-    }
-  }
-  
-  if (doc.containsKey("set_mode")) {
-    JsonVariant setModeValue = doc["set_mode"];
-    if (setModeValue.is<const char*>()) {
-      String setMode = setModeValue.as<String>();
-      setMode.toUpperCase();
-      
-      if (setMode == "COOL" || setMode == "FAN" || setMode == "HEAT" || 
-          setMode == "DRY" || setMode == "AUTO") {
-        cfg.setting.set_mode = setMode;
-        logPrintf("[CMD Setting] Set mode changed to: %s\n", cfg.setting.set_mode.c_str());
-        changed = true;
-      } else {
-        logPrintf("[CMD Setting] ERROR: set_mode must be COOL/FAN/HEAT/DRY/AUTO, got: %s\n", 
-                      setMode.c_str());
-      }
-    } else {
-      logPrintln("[CMD Setting] ERROR: set_mode must be a string");
-    }
-  }
 
-  // === [BARU] Setting Temp Control Cooldown (Min 60 detik) ===
-  if (doc.containsKey("temp_cooldown")) {
-    int val = doc["temp_cooldown"].as<int>();
-    if (val >= 60) {
-      if (cfg.setting.temp_control_cooldown_sec != val) {
-        cfg.setting.temp_control_cooldown_sec = val;
-        logPrintf("[CMD Setting] Temp Cooldown changed to: %d sec\n", val);
-        changed = true;
-      }
-    } else {
-      logPrintln("[CMD Setting] ERROR: temp_cooldown min 60 seconds");
-    }
-  }
+  // global_set_temp, global_min_temp, global_max_temp, global_mode, global_fan,
+  // temp_cooldown, auto_recovery — removed from MQTT command.
+  // All AC parameters now come from schedule periods.
 
-  if (doc.containsKey("auto_recovery")) {
-    int val = doc["auto_recovery"].as<int>();
-    // Kita batasi minimal 60 detik (1 menit) agar tidak bentrok terus
-    if (val >= 60) {
-      if (cfg.setting.auto_recovery_sec != val) {
-        cfg.setting.auto_recovery_sec = val;
-        logPrintf("[CMD Setting] Auto Recovery changed to: %d sec\n", val);
-        changed = true;
-      }
-    } else {
-      logPrintln("[CMD Setting] ERROR: auto_recovery min 60 seconds");
-    }
-  }
-
-  if (doc.containsKey("default_fan")) {
-    JsonVariant defaultFanValue = doc["default_fan"];
-    if (defaultFanValue.is<const char*>()) {
-      String defaultFan = defaultFanValue.as<String>();
-      defaultFan.toUpperCase();
-      defaultFan.trim();
-      
-      // Validasi nilai yang diperbolehkan
-      if (defaultFan == "AUTO" || 
-          defaultFan == "LOW" || defaultFan == "MIN" ||
-          defaultFan == "MED" || defaultFan == "MEDIUM" || 
-          defaultFan == "HIGH" || defaultFan == "MAX" || 
-          defaultFan == "TURBO") {
-        
-        // Normalisasi ke standard value
-        if (defaultFan == "MIN") defaultFan = "LOW";
-        if (defaultFan == "MEDIUM") defaultFan = "MED";
-        if (defaultFan == "MAX") defaultFan = "HIGH";
-        
-        cfg.setting.default_fan = defaultFan;
-        logPrintf("[CMD Setting] Default fan changed to: %s\n", cfg.setting.default_fan.c_str());
-        changed = true;
-      } else {
-        logPrintf("[CMD Setting] ERROR: default_fan must be AUTO/LOW/MED/HIGH/TURBO, got: %s\n", 
-                      defaultFan.c_str());
-        dataPublishAck("setting", "failed", "Invalid default_fan value: " + defaultFan);
-        return;
-      }
-    } else {
-      logPrintln("[CMD Setting] ERROR: default_fan must be a string");
-      dataPublishAck("setting", "failed", "default_fan must be string");
-      return;
-    }
-  }
-  
   if (changed) {
     yield();
     
-    logPrintln("[CMD Setting] Saving config...");
+    Serial.Println("[CMD Setting] Saving config...");
     
     yield();
     
     if (!cfgSave()) {
-      logPrintln("[CMD Setting] ERROR: Failed to save config");
+      Serial.Println("[CMD Setting] ERROR: Failed to save config");
       dataPublishAck("setting", "failed", "Storage write error");
       return; 
     }
     
-    logPrintln("[CMD Setting] Config saved successfully");
+    Serial.Println("[CMD Setting] Config saved successfully");
     yield();
     
     cfgApply();
     yield();
     
     if (mqtt.connected()) {
-      logPrintln("[CMD Setting] Publishing updated setting to MQTT...");
+      Serial.Println("[CMD Setting] Publishing updated setting to MQTT...");
       dataPublishSetting();
     } else {
-      logPrintln("[CMD Setting] WARNING: MQTT not connected, cannot publish");
+      Serial.Println("[CMD Setting] WARNING: MQTT not connected, cannot publish");
     }
-    logPrintln("[CMD Setting] ========== SUCCESS! ==========");
+    Serial.Println("[CMD Setting] ========== SUCCESS! ==========");
   } else {
-    logPrintln("[CMD Setting] No valid changes detected");
+    Serial.Println("[CMD Setting] No valid changes detected");
     dataPublishAck("setting", "success", "No changes detected");
-    logPrintln("[CMD Setting] ========== END (No Change) ==========");
+    Serial.Println("[CMD Setting] ========== END (No Change) ==========");
   }
   if (changed) {
-  logPrintln("[CMD Setting] Setting berubah, force automation re-evaluate");
+  Serial.Println("[CMD Setting] Setting berubah, force automation re-evaluate");
   forceScheduleCheck = true;
   dataPublishAck("setting", "success", "Configuration updated");
   }
 }
 
 static void handleCmdUpdate(const char* payload, unsigned int length) {
-  logPrintln("[CMD Update] ========== START ==========");
+  Serial.Println("[CMD Update] ========== START ==========");
 
   // 1. Cek Sinyal & Parsing
   if (WiFi.RSSI() < -85) {
@@ -1825,33 +1522,33 @@ static void handleCmdUpdate(const char* payload, unsigned int length) {
       dataPublishAck("update", "failed", "URL missing in payload");
   }
 
-  logPrintln("[CMD Update] ========== END ==========");
+  Serial.Println("[CMD Update] ========== END ==========");
 }
 
 // Handler: Update Koneksi (WiFi & MQTT)
 static void handleCmdKoneksi(const char* payload, unsigned int length) {
-  logPrintln("[CMD Koneksi] ========== START ==========");
+  Serial.Println("[CMD Koneksi] ========== START ==========");
   
   if (length > 1024) {
-    logPrintln("[CMD Koneksi] Payload too large");
+    Serial.Println("[CMD Koneksi] Payload too large");
     return;
   }
   
   StaticJsonDocument<1024> doc;
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
-    logPrintln("[CMD Koneksi] JSON parse error: ");
+    Serial.Println("[CMD Koneksi] JSON parse error: ");
     dataPublishAck("koneksi", "failed", "Invalid JSON format");
-    logPrintln(err.c_str());
+    Serial.Println(err.c_str());
     return;
   }
 
-  logPrintln("[CMD Koneksi] JSON parsed OK");
+  Serial.Println("[CMD Koneksi] JSON parsed OK");
 
   // Immutable keys - reject any attempt to modify
   if (doc.containsKey("device_id") || doc.containsKey("ac_brand")) {
     dataPublishAck("koneksi", "failed", "Immutable field (device_id/ac_brand) cannot be changed");
-    logPrintln("[CMD Koneksi] ERROR: Attempt to modify immutable field");
+    Serial.Println("[CMD Koneksi] ERROR: Attempt to modify immutable field");
     return;
   }
   
@@ -1864,9 +1561,10 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   // Check WiFi changes
   if (doc.containsKey("wifi_ssid")) {
     String newSsid = doc["wifi_ssid"].as<String>();
-    logPrintf("[CMD Koneksi] wifi_ssid: '%s' -> '%s'\n", 
+    Serial.Printf("[CMD Koneksi] wifi_ssid: '%s' -> '%s'\n", 
                   cfg.koneksi.wifi_ssid.c_str(), newSsid.c_str());
     if (newSsid.length() > 0 && newSsid != cfg.koneksi.wifi_ssid) {
+      nvs_setWiFiSSID(newSsid);
       cfg.koneksi.wifi_ssid = newSsid;
       wifiChanged = true;
     }
@@ -1874,8 +1572,9 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   
   if (doc.containsKey("wifi_pass")) {
     String newPass = doc["wifi_pass"].as<String>();
-    logPrintln("[CMD Koneksi] wifi_pass: updated");
+    Serial.Println("[CMD Koneksi] wifi_pass: updated");
     if (newPass.length() > 0 && newPass != cfg.koneksi.wifi_pass) {
+      nvs_setWiFiPass(newPass);
       cfg.koneksi.wifi_pass = newPass;
       wifiChanged = true;
     }
@@ -1884,7 +1583,7 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   // Check MQTT changes
   if (doc.containsKey("mqtt_host")) {
     String newHost = doc["mqtt_host"].as<String>();
-    logPrintf("[CMD Koneksi] mqtt_host: '%s' -> '%s'\n", 
+    Serial.Printf("[CMD Koneksi] mqtt_host: '%s' -> '%s'\n", 
                   cfg.koneksi.mqtt_host.c_str(), newHost.c_str());
     if (newHost.length() > 0 && newHost != cfg.koneksi.mqtt_host) {
       cfg.koneksi.mqtt_host = newHost;
@@ -1894,7 +1593,7 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   
   if (doc.containsKey("mqtt_port")) {
     uint16_t newPort = doc["mqtt_port"].as<uint16_t>();
-    logPrintf("[CMD Koneksi] mqtt_port: %d -> %d\n", 
+    Serial.Printf("[CMD Koneksi] mqtt_port: %d -> %d\n", 
                   cfg.koneksi.mqtt_port, newPort);
     if (newPort > 0 && newPort != cfg.koneksi.mqtt_port) {
       cfg.koneksi.mqtt_port = newPort;
@@ -1904,7 +1603,7 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   
   if (doc.containsKey("mqtt_user")) {
     String newUser = doc["mqtt_user"].as<String>();
-    logPrintf("[CMD Koneksi] mqtt_user: '%s' -> '%s'\n", 
+    Serial.Printf("[CMD Koneksi] mqtt_user: '%s' -> '%s'\n", 
                   cfg.koneksi.mqtt_user.c_str(), newUser.c_str());
     if (newUser.length() > 0 && newUser != cfg.koneksi.mqtt_user) {
       cfg.koneksi.mqtt_user = newUser;
@@ -1914,7 +1613,7 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   
   if (doc.containsKey("mqtt_pass")) {
     String newPass = doc["mqtt_pass"].as<String>();
-    logPrintln("[CMD Koneksi] mqtt_pass: updated");
+    Serial.Println("[CMD Koneksi] mqtt_pass: updated");
     if (newPass.length() > 0 && newPass != cfg.koneksi.mqtt_pass) {
       cfg.koneksi.mqtt_pass = newPass;
       mqttChanged = true;
@@ -1923,9 +1622,9 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
 
   // Check if any changes detected
   if (!wifiChanged && !mqttChanged) {
-    logPrintln("[CMD Koneksi] No changes detected");
+    Serial.Println("[CMD Koneksi] No changes detected");
     dataPublishAck("koneksi", "success", "No changes detected");
-    logPrintln("[CMD Koneksi] ========== END (No Change) ==========");
+    Serial.Println("[CMD Koneksi] ========== END (No Change) ==========");
     return;
   }
   
@@ -1933,12 +1632,12 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   esp_task_wdt_reset();
   
   // Save configuration
-  logPrintln("[CMD Koneksi] Changes detected, saving config...");
+  Serial.Println("[CMD Koneksi] Changes detected, saving config...");
   if (wifiChanged) {
-    logPrintf("[CMD Koneksi] WiFi will change to SSID: %s\n", cfg.koneksi.wifi_ssid.c_str());
+    Serial.Printf("[CMD Koneksi] WiFi will change to SSID: %s\n", cfg.koneksi.wifi_ssid.c_str());
   }
   if (mqttChanged) {
-    logPrintf("[CMD Koneksi] MQTT will change to: %s:%d\n", 
+    Serial.Printf("[CMD Koneksi] MQTT will change to: %s:%d\n", 
                   cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port);
   }
   
@@ -1946,13 +1645,13 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   esp_task_wdt_reset();
   
   if (!cfgSave()) {
-    logPrintln("[CMD Koneksi] ERROR: Failed to save config!");
+    Serial.Println("[CMD Koneksi] ERROR: Failed to save config!");
     dataPublishAck("koneksi", "failed", "Storage write error");
-    logPrintln("[CMD Koneksi] ========== END (Save Failed) ==========");
+    Serial.Println("[CMD Koneksi] ========== END (Save Failed) ==========");
     return;
   }
   
-  logPrintln("[CMD Koneksi] Config saved successfully to LittleFS");
+  Serial.Println("[CMD Koneksi] Config saved successfully to LittleFS");
   yield();
   esp_task_wdt_reset();
   
@@ -1966,7 +1665,7 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
 
   // 2. Disconnect MQTT dulu (PENTING: Harus graceful!)
   if (mqtt.connected()) {
-    logPrintln("[CMD Koneksi] Disconnecting MQTT gracefully...");
+    Serial.Println("[CMD Koneksi] Disconnecting MQTT gracefully...");
     isManualDisconnect = true; // Flag agar counter tidak bertambah
     publishStatus("offline");
     delay(200); // Beri waktu pesan terkirim
@@ -1983,7 +1682,7 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   
   // 4. JIKA WIFI BERUBAH: Force disconnect & reconnect
   if (wifiChanged) {
-    logPrintln("[CMD Koneksi] WiFi changed, forcing reconnect...");
+    Serial.Println("[CMD Koneksi] WiFi changed, forcing reconnect...");
     
     // Kirim ACK sebelum disconnect (ini pesan terakhir!)
     dataPublishAck("koneksi", "success", "WiFi changed, reconnecting now...");
@@ -1997,11 +1696,11 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
     // === KUNCI: RESET TIMER AGAR RECONNECT LANGSUNG! ===
     dataScheduleImmediateWiFiRetry();
     
-    logPrintln("[CMD Koneksi] WiFi disconnected, ready for immediate retry");
+    Serial.Println("[CMD Koneksi] WiFi disconnected, ready for immediate retry");
   } 
   // 5. JIKA HANYA MQTT YANG BERUBAH: Reconnect MQTT saja
   else if (mqttChanged) {
-    logPrintln("[CMD Koneksi] Only MQTT changed, reconnecting broker...");
+    Serial.Println("[CMD Koneksi] Only MQTT changed, reconnecting broker...");
     
     dataPublishAck("koneksi", "success", "MQTT settings updated, reconnecting...");
     delay(200);
@@ -2010,18 +1709,18 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
     dataResetConnection();
     lastMqttRetryMs = 0; // Trigger immediate MQTT reconnect
     
-    logPrintln("[CMD Koneksi] MQTT ready for reconnect");
+    Serial.Println("[CMD Koneksi] MQTT ready for reconnect");
   }
   
-  logPrintln("[CMD Koneksi] ========== SUCCESS! ==========");
+  Serial.Println("[CMD Koneksi] ========== SUCCESS! ==========");
 }
 
 // Handler: Update Schedule (jadwal harian)
 static void handleCmdSchedule(const char* payload, unsigned int length) {
-  logPrintln("[CMD Schedule] ========== START ==========");
+  Serial.Println("[CMD Schedule] ========== START ==========");
   
   if (length > 2048) {
-    logPrintln("[CMD Schedule] Payload too large");
+    Serial.Println("[CMD Schedule] Payload too large");
     return;
   }
   
@@ -2030,156 +1729,132 @@ static void handleCmdSchedule(const char* payload, unsigned int length) {
   if (err) {
     Serial.print("[CMD Schedule] JSON parse error: ");
     dataPublishAck("schedule", "failed", "Invalid JSON format");
-    logPrintln(err.c_str());
+    Serial.Println(err.c_str());
     return;
   }
 
-  logPrintln("[CMD Schedule] JSON parsed OK");
+  Serial.Println("[CMD Schedule] JSON parsed OK");
   bool changed = false;
-  
-  if (!doc.containsKey("daily")) {
-    logPrintln("[CMD Schedule] ERROR: Missing 'daily' array");
-    return;
-  }
-  
-  JsonArray daily = doc["daily"].as<JsonArray>();
+
+  JsonArray daily = doc.as<JsonArray>();
   if (daily.isNull()) {
-    logPrintln("[CMD Schedule] ERROR: 'daily' is not a valid array");
+    dataPublishAck("schedule", "failed", "Payload must be root array");
     return;
   }
-  
-  // Valid day names (case insensitive)
-  const char* validDays[] = {"senin", "selasa", "rabu", "kamis", "jumat", "sabtu", "minggu"};
-  const char* validTypes[] = {"part_time", "full_time", "libur"};
-  
-  for (JsonObject dayObj : daily) {
-    // Validasi field 'day'
-    if (!dayObj.containsKey("day")) {
-      logPrintln("[CMD Schedule] SKIP: Missing 'day' field");
+
+  auto isValidHHMM = [](const char* s) -> bool {
+    if (!s || strlen(s) != 5 || s[2] != ':') return false;
+    if (!isdigit(s[0]) || !isdigit(s[1]) || !isdigit(s[3]) || !isdigit(s[4])) return false;
+    int h = (s[0] - '0') * 10 + (s[1] - '0');
+    int m = (s[3] - '0') * 10 + (s[4] - '0');
+    return (h >= 0 && h <= 23 && m >= 0 && m <= 59);
+  };
+
+  for (JsonVariant v : daily) {
+    JsonObject dayObj = v.as<JsonObject>();
+    if (dayObj.isNull()) continue;
+
+    if (!dayObj.containsKey("day") || !dayObj["day"].is<int>()) {
+      Serial.Println("[CMD Schedule] SKIP: 'day' must be numeric (0..6)");
       continue;
     }
-    
-    const char* dayName = dayObj["day"] | "";
-    if (!dayName || strlen(dayName) == 0) {
-      logPrintln("[CMD Schedule] SKIP: Empty day name");
+    int numericDay = dayObj["day"].as<int>();
+    if (numericDay < 0 || numericDay > 6) {
+      Serial.Printf("[CMD Schedule] SKIP: invalid day=%d (valid: 0..6)\n", numericDay);
       continue;
     }
-    
-    // Find day index - case insensitive comparison
-    int idx = -1;
-    for (int i = 0; i < 7; ++i) {
-      if (strcasecmp(dayName, validDays[i]) == 0) {
-        idx = i;
-        break;
-      }
-    }
-    
-    if (idx < 0) {
-      logPrintf("[CMD Schedule] SKIP: Invalid day name '%s' (valid: senin-minggu)\n", dayName);
-      continue;
-    }
-    
-    // Validasi field 'type'
-    if (!dayObj.containsKey("type")) {
-      logPrintf("[CMD Schedule] SKIP: Missing 'type' field for day '%s'\n", dayName);
-      continue;
-    }
-    
+    int idx = DAY_NUM_TO_IDX(numericDay);
+
     const char* type = dayObj["type"] | "";
-    if (!type || strlen(type) == 0) {
-      logPrintf("[CMD Schedule] SKIP: Empty type for day '%s'\n", dayName);
+    if (!type || !*type) {
+      Serial.Printf("[CMD Schedule] SKIP: missing type for day=%d\n", numericDay);
       continue;
     }
-    
-    // Validasi apakah type valid
-    bool validType = false;
-    for (int i = 0; i < 3; i++) {
-      if (strcasecmp(type, validTypes[i]) == 0) {
-        validType = true;
-        break;
-      }
-    }
-    
-    if (!validType) {
-      logPrintf("[CMD Schedule] SKIP: Invalid type '%s' for day '%s' (valid: part_time,full_time,libur)\n", 
-                    type, dayName);
+
+    DaySchedule& d = cfg.setting.daily[idx];
+    memset(d.periods, 0, sizeof(d.periods));
+    d.periodCount = 0;
+
+    if (strcasecmp(type, "offtime") == 0 || strcasecmp(type, "libur") == 0) {
+      d.type = DAY_OFFTIME;
+      changed = true;
       continue;
     }
-    
-    // Process berdasarkan type
-    if (strcasecmp(type, "part_time") == 0) {
-      cfg.setting.daily[idx].type = DAY_PART_TIME;
-      
-      // Handle waktu untuk part_time
-      if (dayObj.containsKey("waktu")) {
-        JsonObject waktu = dayObj["waktu"].as<JsonObject>();
-        if (!waktu.isNull()) {
-          // Ambil waktu mulai
-          const char* mulai = waktu["mulai"] | "";
-          if (mulai && strlen(mulai) > 0) {
-            cfg.setting.daily[idx].waktu.mulai = String(mulai);
-            logPrintf("[CMD Schedule] Updated %s mulai: %s\n", dayName, mulai);
-          } else {
-            logPrintf("[CMD Schedule] %s mulai: keeping old value (%s)\n", 
-                          dayName, cfg.setting.daily[idx].waktu.mulai.c_str());
-          }
-          
-          // Ambil waktu selesai
-          const char* selesai = waktu["selesai"] | "";
-          if (selesai && strlen(selesai) > 0) {
-            cfg.setting.daily[idx].waktu.selesai = String(selesai);
-            logPrintf("[CMD Schedule] Updated %s selesai: %s\n", dayName, selesai);
-          } else {
-            logPrintf("[CMD Schedule] %s selesai: keeping old value (%s)\n", 
-                          dayName, cfg.setting.daily[idx].waktu.selesai.c_str());
-          }
-        } else {
-          logPrintf("[CMD Schedule] %s: invalid waktu object, keeping old values (mulai:%s, selesai:%s)\n", 
-                        dayName, cfg.setting.daily[idx].waktu.mulai.c_str(), 
-                        cfg.setting.daily[idx].waktu.selesai.c_str());
-        }
-      } else {
-        logPrintf("[CMD Schedule] %s: no waktu specified, keeping old values (mulai:%s, selesai:%s)\n", 
-                      dayName, cfg.setting.daily[idx].waktu.mulai.c_str(), 
-                      cfg.setting.daily[idx].waktu.selesai.c_str());
-      }
-      
-      logPrintf("[CMD Schedule] ✓ Updated %s: part_time (%s-%s)\n", 
-                    dayName, cfg.setting.daily[idx].waktu.mulai.c_str(), 
-                    cfg.setting.daily[idx].waktu.selesai.c_str());
-    } 
-    else if (strcasecmp(type, "libur") == 0) {
-      cfg.setting.daily[idx].type = DAY_LIBUR;
-      cfg.setting.daily[idx].waktu.mulai = "";
-      cfg.setting.daily[idx].waktu.selesai = "";
-      logPrintf("[CMD Schedule] ✓ Updated %s: libur\n", dayName);
-    } 
-    else { // full_time
-      cfg.setting.daily[idx].type = DAY_FULL;
-      cfg.setting.daily[idx].waktu.mulai = "";
-      cfg.setting.daily[idx].waktu.selesai = "";
-      logPrintf("[CMD Schedule] ✓ Updated %s: full_time\n", dayName);
+
+    if (strcasecmp(type, "fulltime") == 0 || strcasecmp(type, "full_time") == 0) {
+      d.type = DAY_FULLTIME;
+      d.periodCount = 1;
+      strncpy(d.periods[0].start, "00:00", sizeof(d.periods[0].start) - 1);
+      strncpy(d.periods[0].end, "23:59", sizeof(d.periods[0].end) - 1);
+      d.periods[0].set_temp = cfg.setting.global_set_temp;
+      d.periods[0].min_temp = cfg.setting.global_min_temp;
+      d.periods[0].max_temp = cfg.setting.global_max_temp;
+      strncpy(d.periods[0].mode, cfg.setting.global_mode.c_str(), sizeof(d.periods[0].mode) - 1);
+      strncpy(d.periods[0].fan, cfg.setting.global_fan.c_str(), sizeof(d.periods[0].fan) - 1);
+      changed = true;
+      continue;
     }
-    
+
+    if (strcasecmp(type, "parttime") != 0 && strcasecmp(type, "part_time") != 0) {
+      Serial.Printf("[CMD Schedule] SKIP: invalid type='%s' day=%d\n", type, numericDay);
+      continue;
+    }
+
+    JsonArray arr = dayObj["data"].as<JsonArray>();
+    if (arr.isNull() || arr.size() == 0) {
+      Serial.Printf("[CMD Schedule] SKIP: day=%d parttime requires data[]\n", numericDay);
+      continue;
+    }
+
+    d.type = DAY_PARTTIME;
+    uint8_t cnt = 0;
+    for (JsonVariant pv : arr) {
+      if (cnt >= MAX_PERIODS_PER_DAY) break;
+      JsonObject p = pv.as<JsonObject>();
+      if (p.isNull()) continue;
+
+      const char* start = p["start"] | "";
+      const char* end = p["end"] | "";
+      if (!isValidHHMM(start) || !isValidHHMM(end)) continue;
+
+      strncpy(d.periods[cnt].start, start, sizeof(d.periods[cnt].start) - 1);
+      strncpy(d.periods[cnt].end, end, sizeof(d.periods[cnt].end) - 1);
+      d.periods[cnt].set_temp = p["set_temp"] | cfg.setting.global_set_temp;
+      d.periods[cnt].min_temp = p["min_temp"] | cfg.setting.global_min_temp;
+      d.periods[cnt].max_temp = p["max_temp"] | cfg.setting.global_max_temp;
+      const char* mode = p["mode"] | cfg.setting.global_mode.c_str();
+      const char* fan = p["fan"] | cfg.setting.global_fan.c_str();
+      strncpy(d.periods[cnt].mode, mode, sizeof(d.periods[cnt].mode) - 1);
+      strncpy(d.periods[cnt].fan, fan, sizeof(d.periods[cnt].fan) - 1);
+      cnt++;
+    }
+
+    if (cnt == 0) {
+      Serial.Printf("[CMD Schedule] SKIP: day=%d has no valid periods\n", numericDay);
+      d.type = DAY_OFFTIME;
+      continue;
+    }
+
+    d.periodCount = cnt;
     changed = true;
-    yield(); // Prevent watchdog timeout during loop
+    yield();
   }
 
   if (changed) {
     yield();
     esp_task_wdt_reset();
     
-    logPrintln("[CMD Schedule] Saving schedule...");
+    Serial.Println("[CMD Schedule] Saving schedule...");
     yield();
     
     if (!cfgSave()) {
-      logPrintln("[CMD Schedule] ERROR: Failed to save schedule");
+      Serial.Println("[CMD Schedule] ERROR: Failed to save schedule");
       dataPublishAck("schedule", "failed", "Storage write error");
-      logPrintln("[CMD Schedule] ========== FAILED! ==========");
+      Serial.Println("[CMD Schedule] ========== FAILED! ==========");
       return;
     }
     
-    logPrintln("[CMD Schedule] Schedule saved successfully");
+    Serial.Println("[CMD Schedule] Schedule saved successfully");
     yield();
     esp_task_wdt_reset();
     
@@ -2188,25 +1863,25 @@ static void handleCmdSchedule(const char* payload, unsigned int length) {
     yield();
     
     if (mqtt.connected()) {
-      logPrintln("[CMD Schedule] Publishing updated setting to MQTT...");
+      Serial.Println("[CMD Schedule] Publishing updated setting to MQTT...");
       dataPublishSetting();
     } else {
-      logPrintln("[CMD Schedule] WARNING: MQTT not connected, cannot publish");
+      Serial.Println("[CMD Schedule] WARNING: MQTT not connected, cannot publish");
     }
     dataPublishAck("schedule", "success", "Schedule updated");
-    logPrintln("[CMD Schedule] ========== SUCCESS! ==========");
+    Serial.Println("[CMD Schedule] ========== SUCCESS! ==========");
   } else {
-    logPrintln("[CMD Schedule] No valid changes made");
-    logPrintln("[CMD Schedule] ========== END (No Change) ==========");
+    Serial.Println("[CMD Schedule] No valid changes made");
+    Serial.Println("[CMD Schedule] ========== END (No Change) ==========");
     dataPublishAck("schedule", "success", "No changes made");
   }
 }
 
 static void handleCmdRemote(const char* payload, unsigned int length) {
-  logPrintln("[CMD Remote] ========== START ==========");
+  Serial.Println("[CMD Remote] ========== START ==========");
   
   if (length > 512) {
-    logPrintln("[CMD Remote] Payload too large");
+    Serial.Println("[CMD Remote] Payload too large");
     dataPublishAck("remote", "failed", "Payload too large");
     return;
   }
@@ -2217,21 +1892,21 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
   StaticJsonDocument<512> doc;
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
-    logPrintln("[CMD Remote] JSON parse error: ");
+    Serial.Println("[CMD Remote] JSON parse error: ");
     dataPublishAck("remote", "failed", "Invalid JSON format");
-    logPrintln(err.c_str());
+    Serial.Println(err.c_str());
     return;
   }
   
-  logPrintln("[CMD Remote] JSON parsed OK");
+  Serial.Println("[CMD Remote] JSON parsed OK");
   
   // Validasi: Tolak jika ada nested "remote" object
   if (doc.containsKey("remote")) {
-    logPrintln("[CMD Remote] ERROR: Invalid format - nested 'remote' object detected");
-    logPrintln("[CMD Remote] Expected format: {\"power\":true,\"temp\":23,\"mode\":\"COOL\"}");
-    logPrintln("[CMD Remote] Received format: {\"remote\":{...}} <- INVALID!");
+    Serial.Println("[CMD Remote] ERROR: Invalid format - nested 'remote' object detected");
+    Serial.Println("[CMD Remote] Expected format: {\"power\":true,\"temp\":23,\"mode\":\"COOL\"}");
+    Serial.Println("[CMD Remote] Received format: {\"remote\":{...}} <- INVALID!");
     dataPublishAck("remote", "failed", "Invalid format: remove nested 'remote' wrapper");
-    logPrintln("[CMD Remote] ========== REJECTED ==========");
+    Serial.Println("[CMD Remote] ========== REJECTED ==========");
     return;
   }
   
@@ -2241,17 +1916,17 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
       !doc.containsKey("swing") && !doc.containsKey("sleep") && 
       !doc.containsKey("turbo") && !doc.containsKey("lights") &&
       !doc.containsKey("health")) {
-    logPrintln("[CMD Remote] ERROR: No valid command keys found");
-    logPrintln("[CMD Remote] Valid keys: power, temp, mode, fan, swing, sleep, turbo, lights, health");
+    Serial.Println("[CMD Remote] ERROR: No valid command keys found");
+    Serial.Println("[CMD Remote] Valid keys: power, temp, mode, fan, swing, sleep, turbo, lights, health");
     dataPublishAck("remote", "failed", "No valid command keys");
-    logPrintln("[CMD Remote] ========== REJECTED ==========");
+    Serial.Println("[CMD Remote] ========== REJECTED ==========");
     return;
   }
   
   esp_task_wdt_reset();
   yield();
   
-  logPrintln("[CMD Remote] Sending IR command...");
+  Serial.Println("[CMD Remote] Sending IR command...");
   
   // ═══════════════════════════════════════════════════════════════════
   // [UPDATED] MQTT REMOTE
@@ -2269,9 +1944,9 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
 
   // Extract expected state dari command untuk state matching
   bool expectedPower = doc.containsKey("power") ? doc["power"].as<bool>() : (baselineFrame.valid ? baselineFrame.power : true);
-  String expectedMode = doc.containsKey("mode") ? doc["mode"].as<String>() : (baselineFrame.valid ? baselineFrame.mode : cfg.setting.set_mode);
-  String expectedFan = doc.containsKey("fan") ? doc["fan"].as<String>() : (baselineFrame.valid ? baselineFrame.fan : cfg.setting.default_fan);
-  uint8_t expectedTemp = doc.containsKey("temp") ? doc["temp"].as<uint8_t>() : cfg.setting.set_temp;
+  String expectedMode = doc.containsKey("mode") ? doc["mode"].as<String>() : (baselineFrame.valid ? baselineFrame.mode : cfg.setting.global_mode);
+  String expectedFan = doc.containsKey("fan") ? doc["fan"].as<String>() : (baselineFrame.valid ? baselineFrame.fan : cfg.setting.global_fan);
+  uint8_t expectedTemp = doc.containsKey("temp") ? doc["temp"].as<uint8_t>() : cfg.setting.global_set_temp;
   
   // Set expected state di automation module
   automationSetExpectedStateFromMqtt(expectedPower, expectedMode, expectedFan, expectedTemp);
@@ -2283,8 +1958,8 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
   cmdStr.reserve(512);
   serializeJson(doc, cmdStr);
   
-  logPrintf("[CMD Remote] Command: %s\n", cmdStr.c_str());
-  logPrintf("[CMD Remote] Expected: power=%s mode=%s fan=%s set_temp=%d\n",
+  Serial.Printf("[CMD Remote] Command: %s\n", cmdStr.c_str());
+  Serial.Printf("[CMD Remote] Expected: power=%s mode=%s fan=%s set_temp=%d\n",
             expectedPower ? "ON" : "OFF", expectedMode.c_str(), 
             expectedFan.c_str(), expectedTemp);
   
@@ -2328,7 +2003,7 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
   const uint8_t maxSendAttempts = REMOTE_SINGLE_SEND_EXPERIMENT ? 1 : MAX_REMOTE_SEND_ATTEMPTS;
 
   if (REMOTE_SINGLE_SEND_EXPERIMENT) {
-    logPrintln("[CMD Remote] Single-send experiment: retry disabled (1 MQTT = 1 IR send)");
+    Serial.Println("[CMD Remote] Single-send experiment: retry disabled (1 MQTT = 1 IR send)");
   }
 
   auto normalizeModeLabel = [](String v) -> String {
@@ -2348,8 +2023,8 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
   };
 
   for (uint8_t sendAttempt = 0; sendAttempt < maxSendAttempts && !anyActivityTracked; ++sendAttempt) {
-    logPrintf("[CMD Remote] IR send attempt %u/%u\n", (unsigned)(sendAttempt + 1), (unsigned)maxSendAttempts);
-    controllHandleCommand(cmdStr.c_str(), cmdStr.length());
+    Serial.Printf("[CMD Remote] IR send attempt %u/%u\n", (unsigned)(sendAttempt + 1), (unsigned)maxSendAttempts);
+    controllEnqueueCommand(cmdStr.c_str(), cmdStr.length());
 
     unsigned long t0 = millis();
     bool shouldAccept = false;
@@ -2450,14 +2125,14 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
     }
 
     if (!anyActivityTracked && (sendAttempt + 1) < maxSendAttempts) {
-      logPrintf("[CMD Remote] No matching display response within %lu ms, retrying...\n", (unsigned long)REMOTE_DISPLAY_WAIT_MS);
+      Serial.Printf("[CMD Remote] No matching display response within %lu ms, retrying...\n", (unsigned long)REMOTE_DISPLAY_WAIT_MS);
     }
   }
   
   if (!anyActivityTracked) {
-    logPrintln("[CMD Remote] AC did not respond - activity not tracked");
+    Serial.Println("[CMD Remote] AC did not respond - activity not tracked");
     dataPublishAck("remote", "no_response", "No fresh state change detected after command");
-    logPrintln("[CMD Remote] ========== NO RESPONSE ==========");
+    Serial.Println("[CMD Remote] ========== NO RESPONSE ==========");
     return;
   }
   
@@ -2470,78 +2145,7 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
   // ═══════════════════════════════════════════════════════════════════
   
   dataPublishAck("remote", "success", "Command executed");
-  logPrintln("[CMD Remote] ========== SUCCESS! ==========");
-}
-
-// ==========================================
-// FUNGSI PUBLISH LOGS KE MQTT
-// ==========================================
-static void publishLogs(const String& message) {
-  if (!mqtt.connected() || topicLogs.length() == 0) {
-    return;
-  }
-  
-  // Publish log message ke topic logs
-  mqtt.publish(topicLogs.c_str(), message.c_str(), false);
-}
-
-// ==========================================
-// HANDLER COMMAND LOGS
-// ==========================================
-static void handleCmdLogs(const char* payload, unsigned int length) {
-  logPrintln("╔════════════════════════════════════════╗");
-  logPrintln("║  📝 LOGS CONTROL COMMAND RECEIVED     ║");
-  logPrintln("╚════════════════════════════════════════╝");
-  
-  if (length > 256) {
-    logPrintln("[CMD Logs] Payload too large");
-    dataPublishAck("logs", "failed", "Payload too large");
-    return;
-  }
-
-  StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, payload, length);
-  
-  if (err) {
-    logPrintln("[CMD Logs] JSON parse error");
-    dataPublishAck("logs", "failed", "Invalid JSON format");
-    return;
-  }
-  
-  // Cek apakah ada field "enabled"
-  if (!doc.containsKey("enabled")) {
-    logPrintln("[CMD Logs] Missing 'enabled' field");
-    dataPublishAck("logs", "failed", "Missing 'enabled' field. Use: {\"enabled\": true} or {\"enabled\": false}");
-    return;
-  }
-  
-  bool enable = doc["enabled"].as<bool>();
-  
-  // Set logging status
-  logSetMqttEnabled(enable);
-  
-  // Save to config for persistence
-  cfg.setting.mqtt_log_enabled = enable;
-  cfgSave();
-  
-  String status = enable ? "enabled" : "disabled";
-  logPrintf("[CMD Logs] MQTT logging %s\n", status.c_str());
-  
-  // Send acknowledgment
-  String ackMsg = "MQTT logging " + status;
-  dataPublishAck("logs", "success", ackMsg);
-  
-  // Jika enabled, kirim log konfirmasi ke topic logs
-  if (enable) {
-    String confirmMsg = "[System] MQTT logging enabled\n";
-    publishLogs(confirmMsg);
-  }
-  
-  // Publish updated status immediately so dashboard sees the change
-  publishStatus("online");
-  dataPublishInfo();
-  
-  logPrintln("[CMD Logs] ========== END ==========");
+  Serial.Println("[CMD Remote] ========== SUCCESS! ==========");
 }
 
 // ============= MQTT Message Router =============
@@ -2561,59 +2165,45 @@ static void processQueuedMqttCommand() {
 }
 
 static void routeMqttCommand(const String& topicStr, const char* payload, unsigned int length) {
-  logPrintf("[DEBUG] Recv Topic: '%s' (Len: %d)\n", topicStr.c_str(), topicStr.length());
-  logPrintf("[MQTT] Payload: %s\n", payload);
+  Serial.Printf("[DEBUG] Recv Topic: '%s' (Len: %d)\n", topicStr.c_str(), topicStr.length());
+  Serial.Printf("[MQTT] Payload: %s\n", payload);
 
   if (topicStr.equals(cmdRemote)) {
-    logPrintln("[MQTT] → handleCmdRemote");
+    Serial.Println("[MQTT] → handleCmdRemote");
     handleCmdRemote(payload, length);
   }
   else if (topicStr.equals(cmdSetting)) {
-    logPrintln("[MQTT] → handleCmdSetting");
+    Serial.Println("[MQTT] → handleCmdSetting");
     handleCmdSetting(payload, length);
   }
   else if (topicStr.equals(cmdKoneksi)) {
-    logPrintln("[MQTT] → handleCmdKoneksi");
+    Serial.Println("[MQTT] → handleCmdKoneksi");
     handleCmdKoneksi(payload, length);
   }
   else if (topicStr.equals(cmdSchedule)) {
-    logPrintln("[MQTT] → handleCmdSchedule");
+    Serial.Println("[MQTT] → handleCmdSchedule");
     handleCmdSchedule(payload, length);
   }
   else if (topicStr.equals(topicCmdUpdate)) {
-    logPrintln("[MQTT] → handleCmdUpdate MATCHED!");
+    Serial.Println("[MQTT] → handleCmdUpdate MATCHED!");
     handleCmdUpdate(payload, length);
   }
-  else if (topicStr.equals(cmdDiagnostics)) {
-    logPrintln("╔════════════════════════════════════════╗");
-    logPrintln("║  🔍 DIAGNOSTICS REQUEST RECEIVED      ║");
-    logPrintln("╚════════════════════════════════════════╝");
-    dataPublishAck("diagnostics", "processing", "Generating diagnostics...");
-    delay(500);
-    esp_task_wdt_reset();
-    dataPublishDiagnostics();
-    dataPublishAck("diagnostics", "success", "Diagnostics published to /diagnostics topic");
-    logPrintln("[MQTT] Diagnostics request completed");
-  }
-  else if (topicStr.equals(cmdLogs)) {
-    logPrintln("[MQTT] → handleCmdLogs");
-    handleCmdLogs(payload, length);
-  }
+
   else if (topicStr.equals(cmdInfo)) {
-    logPrintln("╔════════════════════════════════════════╗");
-    logPrintln("║  📊 INFO REQUEST RECEIVED             ║");
-    logPrintln("╚════════════════════════════════════════╝");
+    Serial.Println("╔════════════════════════════════════════╗");
+    Serial.Println("║  📊 INFO REQUEST RECEIVED             ║");
+    Serial.Println("╚════════════════════════════════════════╝");
     dataPublishAck("info", "processing", "Generating system info...");
     delay(300);
     esp_task_wdt_reset();
     dataPublishInfo();
     dataPublishAck("info", "success", "System info published to /info topic");
-    logPrintln("[MQTT] Info request completed");
+    Serial.Println("[MQTT] Info request completed");
   }
   else if (topicStr.equals(cmdReboot)) {
-    logPrintln("╔════════════════════════════════════════╗");
-    logPrintln("║  🔄 REMOTE REBOOT COMMANDED           ║");
-    logPrintln("╚════════════════════════════════════════╝");
+    Serial.Println("╔════════════════════════════════════════╗");
+    Serial.Println("║  🔄 REMOTE REBOOT COMMANDED           ║");
+    Serial.Println("╚════════════════════════════════════════╝");
     StaticJsonDocument<128> doc;
     DeserializationError err = deserializeJson(doc, payload, length);
     int delaySeconds = 3;
@@ -2622,17 +2212,16 @@ static void routeMqttCommand(const String& topicStr, const char* payload, unsign
       if (delaySeconds < 1) delaySeconds = 1;
       if (delaySeconds > 60) delaySeconds = 60;
     }
-    logPrintf("[Reboot] Rebooting in %d seconds...\n", delaySeconds);
+    Serial.Printf("[Reboot] Rebooting in %d seconds...\n", delaySeconds);
     String ackMsg = "Rebooting in " + String(delaySeconds) + " seconds...";
     dataPublishAck("reboot", "success", ackMsg);
     publishStatus("rebooting");
-    cfgSaveDisconnectTimestamp();
     if (LittleFS.begin()) {
       File f = LittleFS.open("/shutdown.flag", "w");
       if (f) {
         f.println("graceful_reboot");
         f.close();
-        logPrintln("[Reboot] Graceful shutdown flag created");
+        Serial.Println("[Reboot] Graceful shutdown flag created");
       }
       LittleFS.remove("/running.flag");
     }
@@ -2642,27 +2231,27 @@ static void routeMqttCommand(const String& topicStr, const char* payload, unsign
       esp_task_wdt_reset();
       mqtt.loop();
     }
-    logPrintln("[Reboot] Restarting now...");
+    Serial.Println("[Reboot] Restarting now...");
     delay(500);
     ESP.restart();
   }
   else {
-    logPrintf("[MQTT] Unknown/Ignored topic: %s\n", topicStr.c_str());
+    Serial.Printf("[MQTT] Unknown/Ignored topic: %s\n", topicStr.c_str());
     if (topicStr.indexOf("update") >= 0) {
-      logPrintln("[DEBUG] WARNING: Topik mengandung kata 'update' tapi tidak cocok persis.");
-      logPrintf("[DEBUG] Harapan: '%s'\n", topicCmdUpdate.c_str());
-      logPrintf("[DEBUG] Diterima: '%s'\n", topicStr.c_str());
+      Serial.Println("[DEBUG] WARNING: Topik mengandung kata 'update' tapi tidak cocok persis.");
+      Serial.Printf("[DEBUG] Harapan: '%s'\n", topicCmdUpdate.c_str());
+      Serial.Printf("[DEBUG] Diterima: '%s'\n", topicStr.c_str());
     }
   }
 }
 
 static void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
   if (length > 2048) {
-    logPrintln("[MQTT] Payload too large, rejected");
+    Serial.Println("[MQTT] Payload too large, rejected");
     return;
   }
   if (pendingCommandCount >= 4) {
-    logPrintln("[MQTT] Command queue full, dropping incoming command");
+    Serial.Println("[MQTT] Command queue full, dropping incoming command");
     return;
   }
 
@@ -2679,7 +2268,7 @@ static void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
   slot.length = copyLen;
   pendingCommandTail = (pendingCommandTail + 1) % 4;
   pendingCommandCount++;
-  logPrintf("[MQTT] Queued command topic='%s' len=%u depth=%u\n", slot.topic, slot.length, pendingCommandCount);
+  Serial.Printf("[MQTT] Queued command topic='%s' len=%u depth=%u\n", slot.topic, slot.length, pendingCommandCount);
 }
 
 void dataCheckPendingSave() {
@@ -2688,7 +2277,7 @@ void dataCheckPendingSave() {
   // Tunggu minimal 2 detik setelah request untuk memastikan tidak ada operasi baca/tulis lain
   if (millis() - saveRequestTime < 2000) return;
   
-  logPrintln("[Data] Processing pending config save...");
+  Serial.Println("[Data] Processing pending config save...");
   
   // Kita tidak perlu disconnect MQTT jika RAM ESP32 Anda cukup (>4MB flash/PSRAM).
   // Namun jika sering crash karena OOM (Out of Memory), biarkan disconnect ini.
@@ -2710,7 +2299,7 @@ void dataCheckPendingSave() {
   
   // Save
   if (cfgSave()) {
-    logPrintln("[Data] ✓ Pending config saved successfully");
+    Serial.Println("[Data] ✓ Pending config saved successfully");
     
     // Apply config baru (terutama jika ada perubahan logic automation)
     cfgApply();
@@ -2719,10 +2308,10 @@ void dataCheckPendingSave() {
     if (wasMqttConnected) {
         // Kita biarkan loop utama yang melakukan reconnect 
         // agar logic-nya terpusat di dataLoop/ensureMqttConnected
-        logPrintln("[Data] Config saved, MQTT will reconnect in main loop");
+        Serial.Println("[Data] Config saved, MQTT will reconnect in main loop");
     }
   } else {
-    logPrintln("[Data] ✗ Failed to save pending config");
+    Serial.Println("[Data] ✗ Failed to save pending config");
   }
   
   pendingSaveRequest = false;
@@ -2735,36 +2324,135 @@ bool dataPublishRaw(const String& topic, const String& payload) {
 
 bool dataPublishInfo() {
   if (!mqtt.connected()) {
-    logPrintln("[Info] Cannot publish - MQTT not connected");
+    Serial.Println("[Info] Cannot publish - MQTT not connected");
     return false;
   }
 
-  StaticJsonDocument<128> doc;
-  doc["fw_version"] = FW_VERSION;
+  StaticJsonDocument<4096> doc;
+
+  // ═══════════════════════════════════════════════
+  // 1. FIRMWARE & BUILD
+  // ═══════════════════════════════════════════════
+  JsonObject fw = doc.createNestedObject("firmware");
+  fw["version"] = FW_VERSION;
+  fw["built_at"] = String(__DATE__) + " " + String(__TIME__);
+  fw["reset_reason"] = getResetReason();
   doc["ac_brand"] = cfg.ac_brand;
-  doc["ip"] = WiFi.localIP().toString();
 
+  // ═══════════════════════════════════════════════
+  // 2. NETWORK DETAILED
+  // ═══════════════════════════════════════════════
+  JsonObject net = doc.createNestedObject("network");
+  net["ip"] = WiFi.localIP().toString();
+  net["mac"] = WiFi.macAddress();
+  net["ssid"] = WiFi.SSID();
+  net["rssi"] = WiFi.RSSI();
+  net["gateway"] = WiFi.gatewayIP().toString();
+  net["dns"] = WiFi.dnsIP(0).toString();
+
+  // ═══════════════════════════════════════════════
+  // 3. MEMORY HEALTH
+  // ═══════════════════════════════════════════════
+  JsonObject mem = doc.createNestedObject("memory");
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  mem["heap_free"] = freeHeap;
+  mem["heap_min"] = ESP.getMinFreeHeap();
+  mem["heap_max_alloc"] = maxAlloc;
+  float fragmentation = 0;
+  if (freeHeap > 0) {
+    fragmentation = 100.0 - ((float)maxAlloc * 100.0 / (float)freeHeap);
+  }
+  mem["fragmentation_pct"] = round(fragmentation * 10) / 10.0;
+  if (psramFound()) {
+    mem["psram_free"] = ESP.getFreePsram();
+  }
+
+  // ═══════════════════════════════════════════════
+  // 4. STATISTIK KONEKSI & RELIABILITY
+  // ═══════════════════════════════════════════════
+  JsonObject conn = doc.createNestedObject("stats");
+  conn["uptime_sec"] = millis() / 1000;
+  conn["mqtt_reconnects"] = mqttReconnectCount;
+  conn["wifi_disconnects"] = wifiDisconnectCount;
+
+  CrashStats cStats = getCrashStats();
+  JsonObject crash = doc.createNestedObject("crash_stats");
+  crash["total_boots"] = cStats.totalBoots;
+  crash["total_crashes"] = cStats.totalCrashes;
+  crash["crash_rate"] = cStats.crashRate;
+  crash["brownouts"] = cStats.brownoutResets;
+
+  // ═══════════════════════════════════════════════
+  // 5. SENSOR HEALTH
+  // ═══════════════════════════════════════════════
+  JsonObject sens = doc.createNestedObject("sensor");
+  sens["healthy"] = sensorIsHealthy();
+  sens["uart_errors"] = uartErrorCount;
+  if (sensorHasValidFrame()) {
+    unsigned long frameAge = sensorTimeSinceLastFrame();
+    if (frameAge < 3600000UL) {
+      sens["last_frame_age"] = frameAge / 1000;
+      sens["last_rx_age_sec"] = frameAge / 1000;
+    } else {
+      sens["last_frame_age"] = -1;
+      sens["last_rx_age_sec"] = -1;
+    }
+  } else {
+    sens["last_frame_age"] = -1;
+    sens["last_rx_age_sec"] = -1;
+  }
+  sens["last_rx_ms"] = sensorGetLastValidFrameMs();
+  sens["comm_error_inferred"] = sensorHasInferredCommError();
+
+  // ═══════════════════════════════════════════════
+  // 6. FILESYSTEM
+  // ═══════════════════════════════════════════════
+  JsonObject fs = doc.createNestedObject("filesystem");
+  fs["used_pct"] = (LittleFS.usedBytes() * 100.0) / LittleFS.totalBytes();
+
+  // ═══════════════════════════════════════════════
+  // 7. WIFI NEARBY & TIMESTAMP
+  // ═══════════════════════════════════════════════
+  JsonArray networks = doc.createNestedArray("wifi_nearby");
+  appendNearbyWifiNetworks(networks);
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    doc["timestamp"] = buf;
+  } else {
+    doc["timestamp"] = "UNSYNCED";
+  }
+
+  // ═══════════════════════════════════════════════
   // PUBLISH
+  // ═══════════════════════════════════════════════
   String payload;
-  serializeJson(doc, payload);
+  payload.reserve(3072);
+  size_t len = serializeJson(doc, payload);
 
-  // Gunakan retain = true agar saat dashboard dibuka, status langsung muncul
+  mqtt.loop();
+  yield();
+  esp_task_wdt_reset();
+
   if (mqtt.publish(topicInfo.c_str(), payload.c_str(), true)) {
-    logPrintf("[Info] ✓ Summary published (fw_version=%s)\n", FW_VERSION);
+    Serial.Printf("[Info] ✓ Published %d bytes (fw=%s)\n", len, FW_VERSION);
     return true;
   } else {
-    logPrintln("[Info] ✗ Failed to publish summary");
+    Serial.Println("[Info] ✗ Failed to publish");
     return false;
   }
 }
 
 bool dataPublishAck(const char* command, const char* status, const String& detail) {
     if (!mqtt.connected()) {
-      logPrintf("[ACK] Skip publish, MQTT disconnected: %s -> %s (%s)\n", command, status, detail.c_str());
+      Serial.Printf("[ACK] Skip publish, MQTT disconnected: %s -> %s (%s)\n", command, status, detail.c_str());
       return false;
     }
     if (topicAck.length() == 0) {
-      logPrintf("[ACK] Skip publish, topicAck empty: %s -> %s (%s)\n", command, status, detail.c_str());
+      Serial.Printf("[ACK] Skip publish, topicAck empty: %s -> %s (%s)\n", command, status, detail.c_str());
       return false;
     }
 
@@ -2800,257 +2488,16 @@ bool dataPublishAck(const char* command, const char* status, const String& detai
       mqtt.loop();
       delay(40);
       esp_task_wdt_reset();
-      logPrintf("[ACK] %s -> %s (%s)\n", command, status, detail.c_str());
+      Serial.Printf("[ACK] %s -> %s (%s)\n", command, status, detail.c_str());
       return true;
     }
 
     consecutivePublishFails++;
-    logPrintf("[ACK] Publish failed: %s -> %s (%s), state=%d, fails=%d\n",
+    Serial.Printf("[ACK] Publish failed: %s -> %s (%s), state=%d, fails=%d\n",
               command, status, detail.c_str(), mqtt.state(), consecutivePublishFails);
     return false;
 }
 
-void dataPublishDiagnostics() {
-  if (!mqtt.connected()) {
-    logPrintln("[Diagnostics] Cannot publish - MQTT not connected");
-    return;
-  }
-  
-  logPrintln("╔════════════════════════════════════════╗");
-  logPrintln("║   🔍 GENERATING FULL DIAGNOSTICS       ║");
-  logPrintln("╚════════════════════════════════════════╝");
-
-  StaticJsonDocument<4096> doc; // Buffer besar
-
-  // ═══════════════════════════════════════════════
-  // 1. FIRMWARE & BUILD
-  // ═══════════════════════════════════════════════
-  JsonObject fw = doc.createNestedObject("firmware");
-  fw["version"] = FW_VERSION;
-  fw["built_at"] = String(__DATE__) + " " + String(__TIME__);
-  fw["reset_reason"] = getResetReason(); // Pindahan dari Info
-
-  // ═══════════════════════════════════════════════
-  // 2. NETWORK DETAILED
-  // ═══════════════════════════════════════════════
-  JsonObject net = doc.createNestedObject("network");
-  net["ip"] = WiFi.localIP().toString();
-  net["mac"] = WiFi.macAddress(); // Pindahan dari Info
-  net["ssid"] = WiFi.SSID();      // Pindahan dari Info
-  net["rssi"] = WiFi.RSSI();
-  net["gateway"] = WiFi.gatewayIP().toString();
-  net["dns"] = WiFi.dnsIP(0).toString();
-
-  doc["wifi_scan_count"] = nearbyWifiCount;
-  doc["wifi_scan_in_progress"] = nearbyWifiScanInProgress;
-  doc["wifi_scan_age_ms"] = lastNearbyWifiScanCompleteMs == 0 ? 0UL : (millis() - lastNearbyWifiScanCompleteMs);
-  JsonArray wifiNearby = doc.createNestedArray("wifi_nearby");
-  appendNearbyWifiNetworks(wifiNearby);
-
-  // ═══════════════════════════════════════════════
-  // 3. MEMORY HEALTH (Complete)
-  // ═══════════════════════════════════════════════
-  JsonObject mem = doc.createNestedObject("memory");
-  uint32_t freeHeap = ESP.getFreeHeap();
-  uint32_t maxAlloc = ESP.getMaxAllocHeap();
-  
-  mem["heap_free"] = freeHeap;
-  mem["heap_min"] = ESP.getMinFreeHeap();      // Pindahan dari Info
-  mem["heap_max_alloc"] = maxAlloc;            // Pindahan dari Info
-  
-  // Hitung Fragmentasi
-  float fragmentation = 0;
-  if (freeHeap > 0) {
-    fragmentation = 100.0 - ((float)maxAlloc * 100.0 / (float)freeHeap);
-  }
-  mem["fragmentation_pct"] = round(fragmentation * 10) / 10.0;
-  
-  if (psramFound()) {
-    mem["psram_free"] = ESP.getFreePsram();
-  }
-
-  // ═══════════════════════════════════════════════
-  // 4. STATISTIK KONEKSI & RELIABILITY
-  // ═══════════════════════════════════════════════
-  JsonObject conn = doc.createNestedObject("stats");
-  conn["uptime_sec"] = millis() / 1000;
-  conn["mqtt_reconnects"] = mqttReconnectCount;  // Pindahan dari Info
-  conn["wifi_disconnects"] = wifiDisconnectCount; // Pindahan dari Info
-  
-  // Crash Stats Summary
-  CrashStats cStats = getCrashStats();
-  JsonObject crash = doc.createNestedObject("crash_stats"); // Pindahan dari Info
-  crash["total_boots"] = cStats.totalBoots;
-  crash["total_crashes"] = cStats.totalCrashes;
-  crash["crash_rate"] = cStats.crashRate;
-  crash["brownouts"] = cStats.brownoutResets;
-
-  // ═══════════════════════════════════════════════
-  // 5. SENSOR HEALTH DETAILED
-  // ═══════════════════════════════════════════════
-  JsonObject sens = doc.createNestedObject("sensor");
-  sens["healthy"] = sensorIsHealthy();
-  sens["uart_errors"] = uartErrorCount;           // Pindahan dari Info
-  
-  // Fix: Handle case when no valid frame exists (avoid 4294967295)
-  if (sensorHasValidFrame()) {
-    unsigned long frameAge = sensorTimeSinceLastFrame();
-    // Additional check: if frameAge is abnormally large (> 1 hour), treat as invalid
-    if (frameAge < 3600000UL) { // 3600000ms = 1 hour
-      sens["last_frame_age"] = frameAge / 1000;
-      sens["last_rx_age_sec"] = frameAge / 1000;
-    } else {
-      sens["last_frame_age"] = -1; // Invalid/too old
-      sens["last_rx_age_sec"] = -1;
-    }
-  } else {
-    sens["last_frame_age"] = -1; // No valid frame
-    sens["last_rx_age_sec"] = -1;
-  }
-  
-  sens["last_rx_ms"] = sensorGetLastValidFrameMs();  // Timestamp last valid frame (milliseconds since boot)
-  sens["comm_error_inferred"] = sensorHasInferredCommError();
-
-  // ═══════════════════════════════════════════════
-  // 6. AUTOMATION STATS
-  // ═══════════════════════════════════════════════
-  JsonObject autoStats = doc.createNestedObject("automation"); // Pindahan dari Info
-  autoStats["active"] = cfg.setting.automation;
-  autoStats["manual_mode"] = cfg.setting.manualModeActive;
-  autoStats["auto_on"] = autoOnCount;
-  autoStats["auto_off"] = autoOffCount;
-  autoStats["manual_override"] = manualOverrideCount;
-  autoStats["ir_sent"] = irSendCount;
-
-  // ═══════════════════════════════════════════════
-  // 7. IR LED HEALTH (NEW)
-  // ═══════════════════════════════════════════════
-  IRHealthStats irStats = irHealthGetStats();
-  JsonObject irHealth = doc.createNestedObject("ir_led_health");
-  irHealth["enabled"] = irHealthIsEnabled();
-  irHealth["total_commands"] = irStats.totalCommands;
-  irHealth["success_count"] = irStats.successCount;
-  irHealth["no_response_count"] = irStats.noResponseCount;
-  irHealth["mismatch_count"] = irStats.mismatchCount;
-  irHealth["success_rate"] = round(irStats.getSuccessRate() * 10) / 10.0;
-  irHealth["health_status"] = irStats.getHealthStatus();
-  
-  // Last command details
-  if (irStats.lastCommandMs > 0) {
-    JsonObject lastCmd = irHealth.createNestedObject("last_command");
-    lastCmd["success"] = irStats.lastCommandSuccess;
-    lastCmd["type"] = irStats.lastCommandType;
-    lastCmd["expected"] = irStats.lastExpected;
-    lastCmd["actual"] = irStats.lastActual;
-    lastCmd["age_sec"] = (millis() - irStats.lastCommandMs) / 1000;
-  }
-
-  // ═══════════════════════════════════════════════
-  // 8. FILESYSTEM
-  // ═══════════════════════════════════════════════
-  JsonObject fs = doc.createNestedObject("filesystem");
-  fs["used_pct"] = (LittleFS.usedBytes() * 100.0) / LittleFS.totalBytes();
-
-  // ═══════════════════════════════════════════════
-  // 9. HEALTH SCORE CALCULATION (Logic Pindahan dari Info)
-  // ═══════════════════════════════════════════════
-  int healthScore = 100;
-  JsonArray alerts = doc.createNestedArray("health_alerts"); // Pindahan dari Info
-
-  // --- Penilaian Memory ---
-  if (freeHeap < 15000) {
-    healthScore -= 40;
-    alerts.add("CRITICAL: Low memory");
-  } else if (freeHeap < 25000) {
-    healthScore -= 20;
-    alerts.add("WARNING: Memory pressure");
-  }
-  
-  if (fragmentation > 40) {
-    healthScore -= 15;
-    alerts.add("WARNING: High fragmentation");
-  }
-
-  // --- Penilaian WiFi ---
-  int rssi = WiFi.RSSI();
-  if (rssi < -85) {
-    healthScore -= 20;
-    alerts.add("CRITICAL: Weak Signal");
-  } else if (rssi < -75) {
-    healthScore -= 10;
-  }
-
-  // --- Penilaian Sensor ---
-  if (!sensorIsHealthy()) {
-    healthScore -= 25;
-    alerts.add("CRITICAL: Sensor Disconnected");
-  } else if (uartErrorCount > 50) {
-    healthScore -= 10;
-    alerts.add("WARNING: High UART Errors");
-  }
-  
-  // --- Penilaian IR LED Health ---
-  float irSuccessRate = irStats.getSuccessRate();
-  if (irStats.totalCommands > 10) { // Only evaluate after sufficient commands
-    if (irSuccessRate < 70.0) {
-      healthScore -= 30;
-      alerts.add("CRITICAL: IR LED Failing");
-    } else if (irSuccessRate < 85.0) {
-      healthScore -= 15;
-      alerts.add("WARNING: IR LED Unreliable");
-    } else if (irSuccessRate < 95.0) {
-      healthScore -= 5;
-      alerts.add("INFO: IR LED Occasional Issues");
-    }
-    
-    if (irStats.noResponseCount > 5) {
-      alerts.add("WARNING: IR LED No Response Detected");
-    }
-    if (irStats.mismatchCount > 3) {
-      alerts.add("WARNING: IR LED Mismatch Detected");
-    }
-  }
-
-  // --- Penilaian Stabilitas ---
-  if (cStats.crashRate > 10.0) {
-    healthScore -= 20;
-    alerts.add("CRITICAL: High Crash Rate");
-  }
-  if (cStats.brownoutResets > 2) {
-    healthScore -= 15;
-    alerts.add("WARNING: Unstable Power (Brownout)");
-  }
-
-  // Clamp Score
-  if (healthScore < 0) healthScore = 0;
-  
-  // Tentukan Status Text
-  String healthStatus = "HEALTHY";
-  if (healthScore < 50) healthStatus = "CRITICAL";
-  else if (healthScore < 75) healthStatus = "WARNING";
-
-  // Masukkan ke JSON
-  doc["health_score"] = healthScore;
-  doc["health_status"] = healthStatus;
-
-  doc["timestamp"] = millis() / 1000;
-
-  // ═══════════════════════════════════════════════
-  // 9. PUBLISH
-  // ═══════════════════════════════════════════════
-  String payload;
-  payload.reserve(4096);
-  size_t len = serializeJson(doc, payload);
-  
-  // Sesuaikan topic ID
-  String topic = "isems/devices/" + cfg.device_id + "/diagnostics"; // Pastikan cfg.device.deviceId sesuai struct Anda
-  
-  if (mqtt.publish(topic.c_str(), payload.c_str(), true)) {
-    logPrintln("╔════════════════════════════════════════╗");
-    logPrintln("║  ✅ DIAGNOSTICS PUBLISHED              ║");
-    logPrintln("╚════════════════════════════════════════╝");
-    logPrintf("Size: %d bytes | Score: %d (%s)\n", len, healthScore, healthStatus.c_str());
-  } else {
-    logPrintln("[Diagnostics] ✗ Failed to publish");
-  }
-}
+// dataPublishDiagnostics() — REMOVED.
+// All diagnostic data merged into dataPublishInfo() above.
+// The /diagnostics topic is no longer published.

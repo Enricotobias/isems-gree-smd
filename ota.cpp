@@ -1,6 +1,6 @@
 #include "ota.h"
 #include "config.h"
-#include "logger.h"
+
 #include "data.h"
 
 // --- FIX: PINDAHKAN INCLUDE INI KE ATAS (GLOBAL SCOPE) ---
@@ -21,7 +21,7 @@ static const char* OTA_PENDING_ACK_FILE = "/ota_ack_pending.json";
 static bool otaStorePendingSuccessAck(const String& detail) {
     File file = LittleFS.open(OTA_PENDING_ACK_FILE, "w");
     if (!file) {
-        logPrintln("[OTA] Failed to store pending success ACK");
+        Serial.Println("[OTA] Failed to store pending success ACK");
         return false;
     }
 
@@ -29,7 +29,7 @@ static bool otaStorePendingSuccessAck(const String& detail) {
     doc["detail"] = detail;
     serializeJson(doc, file);
     file.close();
-    logPrintln("[OTA] Pending success ACK stored");
+    Serial.Println("[OTA] Pending success ACK stored");
     return true;
 }
 
@@ -40,7 +40,7 @@ static bool otaLoadPendingSuccessAck(String& detail) {
 
     File file = LittleFS.open(OTA_PENDING_ACK_FILE, "r");
     if (!file) {
-        logPrintln("[OTA] Pending ACK file exists but cannot be opened");
+        Serial.Println("[OTA] Pending ACK file exists but cannot be opened");
         return false;
     }
 
@@ -48,7 +48,7 @@ static bool otaLoadPendingSuccessAck(String& detail) {
     DeserializationError err = deserializeJson(doc, file);
     file.close();
     if (err) {
-        logPrintf("[OTA] Pending ACK file invalid: %s\n", err.c_str());
+        Serial.Printf("[OTA] Pending ACK file invalid: %s\n", err.c_str());
         return false;
     }
 
@@ -69,15 +69,15 @@ static void otaPublishPendingSuccessAckIfAny() {
     }
 
     if (!dataIsConnected()) {
-        logPrintln("[OTA] Pending success ACK exists but MQTT is not connected yet");
+        Serial.Println("[OTA] Pending success ACK exists but MQTT is not connected yet");
         return;
     }
 
     if (dataPublishAck("update", "success", detail)) {
-        logPrintln("[OTA] Pending success ACK published after reboot");
+        Serial.Println("[OTA] Pending success ACK published after reboot");
         otaClearPendingSuccessAck();
     } else {
-        logPrintln("[OTA] Failed to publish pending success ACK after reboot; will retry on next reconnect");
+        Serial.Println("[OTA] Failed to publish pending success ACK after reboot; will retry on next reconnect");
     }
 }
 
@@ -156,7 +156,7 @@ bool isNewer(String current, String newer) {
     long newerInt = parse(newer);
 
     // Debugging (Opsional, akan muncul di Serial Monitor)
-    // logPrintf("[OTA Debug] Compare: %ld vs %ld\n", currentInt, newerInt);
+    // Serial.Printf("[OTA Debug] Compare: %ld vs %ld\n", currentInt, newerInt);
 
     return newerInt > currentInt;
 }
@@ -165,14 +165,14 @@ bool isNewer(String current, String newer) {
 // FUNGSI INTI: DOWNLOAD BINARY DENGAN MD5
 // ==========================================
 void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
-    logPrintln("[OTA] Starting binary download...");
+    Serial.Println("[OTA] Starting binary download...");
     dataPublishAck("update", "progress", "Downloading firmware...");
     
     // === RAII PATTERN - AUTO CLEANUP ===
     HTTPClientRAII httpClient;
     
     if (!httpClient.begin(url)) {
-        logPrintln("[OTA] Connection init failed");
+        Serial.Println("[OTA] Connection init failed");
         dataPublishAck("update", "failed", "Connection init failed");
         return; // Destructor otomatis cleanup
     }
@@ -184,13 +184,13 @@ void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
     int code = httpClient->GET();
     
     if (code != HTTP_CODE_OK) {
-        logPrintf("[OTA] HTTP Error Code: %d\n", code);
+        Serial.Printf("[OTA] HTTP Error Code: %d\n", code);
         dataPublishAck("update", "failed", "HTTP Error " + String(code));
         return; // Auto cleanup
     }
 
     int contentLength = httpClient->getSize();
-    logPrintf("[OTA] Size: %d bytes\n", contentLength);
+    Serial.Printf("[OTA] Size: %d bytes\n", contentLength);
     
     if (contentLength <= 0) {
         dataPublishAck("update", "failed", "Empty content length");
@@ -205,7 +205,7 @@ void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
 
     // Set MD5 checksum
     if (expectedMD5.length() == 32) {
-        logPrintf("[OTA] Setting MD5: %s\n", expectedMD5.c_str());
+        Serial.Printf("[OTA] Setting MD5: %s\n", expectedMD5.c_str());
         Update.setMD5(expectedMD5.c_str());
     }
 
@@ -223,7 +223,7 @@ void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
             int c = stream->readBytes(buff, min(avail, sizeof(buff)));
             
             if (Update.write(buff, c) != c) {
-                logPrintln("[OTA] Write error detected");
+                Serial.Println("[OTA] Write error detected");
                 dataPublishAck("update", "failed", "Flash write error");
                 writeError = true;
                 break; // ✅ AMAN - Destructor akan cleanup
@@ -235,7 +235,7 @@ void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
             if (millis() - lastAck > 2000) {
                 int pct = (written * 100) / contentLength;
                 String msg = "Flashing: " + String(pct) + "%";
-                logPrintln("[OTA] " + msg);
+                Serial.Println("[OTA] " + msg);
                 dataPublishAck("update", "progress", msg);
                 lastAck = millis();
             }
@@ -245,21 +245,21 @@ void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
 
     // Check result
     if (writeError) {
-        logPrintln("[OTA] Aborted due to write error");
+        Serial.Println("[OTA] Aborted due to write error");
         return; // Auto cleanup
     }
 
     if (written != contentLength) {
-        logPrintf("[OTA] Download incomplete: %d/%d bytes\n", written, contentLength);
+        Serial.Printf("[OTA] Download incomplete: %d/%d bytes\n", written, contentLength);
         dataPublishAck("update", "failed", "Download interrupted");
         return; // Auto cleanup
     }
 
-    logPrintln("[OTA] Download complete. Verifying MD5...");
+    Serial.Println("[OTA] Download complete. Verifying MD5...");
     dataPublishAck("update", "progress", "Verifying MD5...");
     
     if (Update.end()) {
-        logPrintln("[OTA] SUCCESS! MD5 Match.");
+        Serial.Println("[OTA] SUCCESS! MD5 Match.");
         String successDetail = "Update OK. Rebooting...";
         otaStorePendingSuccessAck(successDetail);
         dataPublishAck("update", "success", successDetail);
@@ -272,7 +272,7 @@ void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
         ESP.restart();
     } else {
         String reason = Update.errorString();
-        logPrintf("[OTA] Verification failed: %s\n", reason.c_str());
+        Serial.Printf("[OTA] Verification failed: %s\n", reason.c_str());
         dataPublishAck("update", "failed", "MD5 Mismatch: " + reason);
         return; // Auto cleanup
     }
@@ -282,14 +282,14 @@ void otaDownloadAndFlash(const String& url, const String& expectedMD5) {
 // FUNGSI UTAMA: CEK MANIFEST JSON
 // ==========================================
 void otaProcessManifest(const String& manifestUrl) {
-    logPrintln("[OTA] Checking manifest...");
+    Serial.Println("[OTA] Checking manifest...");
     dataPublishAck("update", "processing", "Checking version info...");
 
     // === RAII PATTERN ===
     HTTPClientRAII httpClient;
     
     if (!httpClient.begin(manifestUrl)) {
-        logPrintln("[OTA] Manifest connection init failed");
+        Serial.Println("[OTA] Manifest connection init failed");
         dataPublishAck("update", "failed", "Manifest URL unreachable");
         return; // Auto cleanup
     }
@@ -301,25 +301,25 @@ void otaProcessManifest(const String& manifestUrl) {
     esp_task_wdt_reset();
     yield();
     
-    logPrintln("[OTA] Sending GET request to manifest...");
+    Serial.Println("[OTA] Sending GET request to manifest...");
     int code = httpClient->GET();
     
-    logPrintf("[OTA] Manifest HTTP Code: %d\n", code);
+    Serial.Printf("[OTA] Manifest HTTP Code: %d\n", code);
     
     if (code != 200) {
-        logPrintf("[OTA] Manifest HTTP Error: %d\n", code);
+        Serial.Printf("[OTA] Manifest HTTP Error: %d\n", code);
         dataPublishAck("update", "failed", "Manifest HTTP " + String(code));
         return; // Auto cleanup
     }
 
     String json = httpClient->getString();
-    logPrintln("[OTA] Manifest JSON: " + json);
+    Serial.Println("[OTA] Manifest JSON: " + json);
     
     StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, json);
     
     if (err) {
-        logPrintf("[OTA] JSON Parse Error: %s\n", err.c_str());
+        Serial.Printf("[OTA] JSON Parse Error: %s\n", err.c_str());
         dataPublishAck("update", "failed", "Invalid JSON Manifest");
         return; // Auto cleanup
     }
@@ -330,7 +330,7 @@ void otaProcessManifest(const String& manifestUrl) {
     
     String curVer = String(FW_VERSION);
 
-    logPrintf("[OTA] Current: %s | New: %s\n", curVer.c_str(), newVer.c_str());
+    Serial.Printf("[OTA] Current: %s | New: %s\n", curVer.c_str(), newVer.c_str());
 
     if (newVer.length() == 0 || binUrl.length() == 0) {
         dataPublishAck("update", "failed", "Invalid manifest data");
@@ -363,14 +363,14 @@ void otaProcessManifest(const String& manifestUrl) {
 // PROBE URL (Fungsi Lama / Utility)
 // ==========================================
 int otaProbeURL(const String& url) {
-    logPrintln("[OTA] ====== CONNECTION TEST ======");
-    logPrintf("[OTA] Target URL: %s\n", url.c_str());
+    Serial.Println("[OTA] ====== CONNECTION TEST ======");
+    Serial.Printf("[OTA] Target URL: %s\n", url.c_str());
     
     // === RAII PATTERN ===
     HTTPClientRAII httpClient;
     
     if (!httpClient.begin(url)) {
-        logPrintln("[OTA] Connection failed to init");
+        Serial.Println("[OTA] Connection failed to init");
         return -1; // Auto cleanup
     }
     
@@ -383,27 +383,27 @@ int otaProbeURL(const String& url) {
     const char* headerKeys[] = {"Content-Type", "Content-Length"};
     httpClient->collectHeaders(headerKeys, 2);
     
-    logPrintln("[OTA] Sending HEAD request...");
+    Serial.Println("[OTA] Sending HEAD request...");
     int httpCode = httpClient->sendRequest("HEAD");
     
     esp_task_wdt_reset();
     
     // Fallback to GET if HEAD fails
     if (httpCode == 405 || httpCode < 0) {
-        logPrintln("[OTA] HEAD failed, trying GET...");
+        Serial.Println("[OTA] HEAD failed, trying GET...");
         httpCode = httpClient->GET();
     }
     
-    logPrintf("[OTA] HTTP Response Code: %d\n", httpCode);
+    Serial.Printf("[OTA] HTTP Response Code: %d\n", httpCode);
 
     if (httpCode == HTTP_CODE_OK) {
         String contentType = httpClient->header("Content-Type");
-        logPrintf("[OTA] Content-Type: %s\n", contentType.c_str());
+        Serial.Printf("[OTA] Content-Type: %s\n", contentType.c_str());
         
         // Validate content type
         if (contentType.indexOf("text/html") >= 0 || 
             contentType.indexOf("application/json") >= 0) {
-            logPrintln("[OTA] Error: Link is webpage, not binary!");
+            Serial.Println("[OTA] Error: Link is webpage, not binary!");
             return 415; // Auto cleanup
         }
         
@@ -413,22 +413,22 @@ int otaProbeURL(const String& url) {
             long fileSize = contentLenStr.toInt();
             long freeSpace = ESP.getFreeSketchSpace();
             
-            logPrintf("[OTA] File: %ld bytes, Free: %ld bytes\n", 
+            Serial.Printf("[OTA] File: %ld bytes, Free: %ld bytes\n", 
                       fileSize, freeSpace);
             
             if (fileSize > freeSpace) {
-                logPrintln("[OTA] Error: File too large!");
+                Serial.Println("[OTA] Error: File too large!");
                 return 413; // Auto cleanup
             }
             
             if (fileSize < 10000) {
-                logPrintln("[OTA] Error: File too small!");
+                Serial.Println("[OTA] Error: File too small!");
                 return 204; // Auto cleanup
             }
         }
     }
 
-    logPrintln("[OTA] ====== TEST COMPLETE ======");
+    Serial.Println("[OTA] ====== TEST COMPLETE ======");
     return httpCode; // Auto cleanup
 }
 
@@ -443,29 +443,29 @@ void otaValidateFirmware() {
 
     if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
         if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            logPrintln("[OTA] ⚠️ New firmware detected. Validating...");
+            Serial.Println("[OTA] ⚠️ New firmware detected. Validating...");
             
             // Mark firmware as valid to prevent rollback
             if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
-                logPrintln("[OTA] ✅ Firmware MARKED VALID.");
+                Serial.Println("[OTA] ✅ Firmware MARKED VALID.");
 
                 if (dataIsConnected()) {
                     dataPublishAck("system", "success", "Firmware validated!");
                 }
                 otaPublishPendingSuccessAckIfAny();
             } else {
-                logPrintln("[OTA] ❌ Failed to mark firmware valid!");
+                Serial.Println("[OTA] ❌ Failed to mark firmware valid!");
             }
         } else {
-            logPrintln("[OTA] Firmware already validated (no pending state).");
+            Serial.Println("[OTA] Firmware already validated (no pending state).");
             otaPublishPendingSuccessAckIfAny();
         }
     } else {
-        logPrintln("[OTA] ⚠️ Could not read OTA partition state.");
+        Serial.Println("[OTA] ⚠️ Could not read OTA partition state.");
         otaPublishPendingSuccessAckIfAny();
     }
 }
 
 void otaInit() {
-    logPrintln("[OTA] Init complete");
+    Serial.Println("[OTA] Init complete");
 }

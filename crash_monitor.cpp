@@ -1,6 +1,7 @@
 #include "crash_monitor.h"
 #include "data.h"
-#include "logger.h"
+#include "config.h"
+
 #include <ArduinoJson.h>
 #include "LittleFS.h"
 

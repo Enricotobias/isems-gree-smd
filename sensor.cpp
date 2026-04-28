@@ -1,5 +1,7 @@
 #include "sensor.h"
-#include "logger.h"
+#include "config.h"
+#include "rtos_common.h"
+
 
 // GREE BP parser - ported from Python reference implementation
 // Handles DLE pairs, error decoding, and proper frame parsing
@@ -408,7 +410,7 @@ void sensorInit() {
   haveDisplayFrame = false;
   lastDisplayFrame = {false,false,0,"","",""};
   
-  logPrintln("[Sensor] Init done (MB=IO20/UART0, DSP=IO3/UART1)");
+  Serial.Println("[Sensor] Init done (MB=IO20/UART0, DSP=IO3/UART1)");
 }
 
 // ============================================================================
@@ -535,14 +537,14 @@ void sensorPoll() {
             uint16_t errRaw = ((uint16_t)errHigh << 8) | errLow;
 
             if (errRaw == 0) {
-              logPrintln("[MAINBOARD] BP_FRAME");
+              Serial.Println("[MAINBOARD] BP_FRAME");
             } else {
-              logPrintln("[MAINBOARD] BP_FRAME_WITH_ERROR_BITS");
+              Serial.Println("[MAINBOARD] BP_FRAME_WITH_ERROR_BITS");
             }
 
-            logPrintf("HEX   : %s\n", hex.c_str());
-            logPrintf("INFO  : %s\n", info.c_str());
-            logPrintf("ERROR : raw=0x%04X (byte4=%02X byte13=%02X)\n", errRaw, errLow, errHigh);
+            Serial.Printf("HEX   : %s\n", hex.c_str());
+            Serial.Printf("INFO  : %s\n", info.c_str());
+            Serial.Printf("ERROR : raw=0x%04X (byte4=%02X byte13=%02X)\n", errRaw, errLow, errHigh);
             
             lastLoggedFrame = d;
             lastLoggedFrameValid = true;
@@ -550,8 +552,8 @@ void sensorPoll() {
 
           if (inferredCommError) {
             inferredCommError = false;
-            logPrintln("[MAINBOARD] BP_RECOVERED");
-            logPrintln("INFO  : BPFrame stream recovered");
+            Serial.Println("[MAINBOARD] BP_RECOVERED");
+            Serial.Println("INFO  : BPFrame stream recovered");
           }
 
           // ═══════════════════════════════════════════════════════════════
@@ -560,7 +562,7 @@ void sensorPoll() {
           // ═══════════════════════════════════════════════════════════════
           if (uartErrorFlagActive) {
             uartErrorFlagActive = false;
-            logPrintln("[MAINBOARD] UART error flag reset (valid frame received)");
+            Serial.Println("[MAINBOARD] UART error flag reset (valid frame received)");
           }
 
           lastValidFrameMs = millis();
@@ -577,6 +579,11 @@ void sensorPoll() {
             lastPrintedMode = d.mode;
             lastPrintedFan = d.fan;
             firstFrameReceived = true;
+            
+            // Wake automation task immediately for fast external change detection
+            if (g_taskAutomation) {
+              xTaskNotifyGive(g_taskAutomation);
+            }
           }
         }
         i += FRAME_LEN;
@@ -589,7 +596,7 @@ void sensorPoll() {
         if (everHadValidFrame && !uartErrorFlagActive) {
           uartErrorCount++;
           uartErrorFlagActive = true;  // Set flag, prevent spam increment
-          logPrintf("[MAINBOARD] Error: Header found but frame invalid (UART Error Count: %lu)\n", uartErrorCount);
+          Serial.Printf("[MAINBOARD] Error: Header found but frame invalid (UART Error Count: %lu)\n", uartErrorCount);
         }
         i++;
       }
@@ -603,16 +610,16 @@ void sensorPoll() {
         }
       }
 
-      logPrintln("[MAINBOARD] STARTUP RAW DIAGNOSTIC");
-      logPrintf("RAWLEN: %u CLEANLEN: %u HEADER_OFFSET: %d\n",
+      Serial.Println("[MAINBOARD] STARTUP RAW DIAGNOSTIC");
+      Serial.Printf("RAWLEN: %u CLEANLEN: %u HEADER_OFFSET: %d\n",
                 (unsigned)rawLen, (unsigned)cleanLen, headerOffset);
-      logPrintf("RAW   : %s\n", hexdump_line(rxBuf, rawLen, 48).c_str());
-      logPrintf("CLEAN : %s\n", hexdump_line(cleanBuf, cleanLen, 48).c_str());
+      Serial.Printf("RAW   : %s\n", hexdump_line(rxBuf, rawLen, 48).c_str());
+      Serial.Printf("CLEAN : %s\n", hexdump_line(cleanBuf, cleanLen, 48).c_str());
 
       if (headerOffset >= 0 && cleanLen < FRAME_LEN) {
-        logPrintln("INFO  : Header 1E 14 terlihat, tetapi panjang frame kurang dari 24 byte");
+        Serial.Println("INFO  : Header 1E 14 terlihat, tetapi panjang frame kurang dari 24 byte");
       } else if (headerOffset < 0) {
-        logPrintln("INFO  : Tidak ada header 1E 14 di data mainboard yang diterima");
+        Serial.Println("INFO  : Tidak ada header 1E 14 di data mainboard yang diterima");
       }
 
       mainboardStartupDebugLogged = true;
@@ -634,11 +641,11 @@ void sensorPoll() {
         if (!uartErrorFlagActive) {
           uartErrorCount++;
           uartErrorFlagActive = true;
-          logPrintf("[MAINBOARD] BP_INFERRED_COMM_TIMEOUT (UART Error Count: %lu)\n", uartErrorCount);
+          Serial.Printf("[MAINBOARD] BP_INFERRED_COMM_TIMEOUT (UART Error Count: %lu)\n", uartErrorCount);
         } else {
-          logPrintln("[MAINBOARD] BP_INFERRED_COMM_TIMEOUT (already counted in this period)");
+          Serial.Println("[MAINBOARD] BP_INFERRED_COMM_TIMEOUT (already counted in this period)");
         }
-        logPrintln("INFO  : no valid BPFrame received (err=E6(Comm Error))");
+        Serial.Println("INFO  : no valid BPFrame received (err=E6(Comm Error))");
       }
     }
   }
@@ -675,9 +682,9 @@ void sensorPoll() {
             String hex = hexdump_line(&dispRxBuf[i], FRAME_LEN);
             String info = describeDisplayInfo(d);
 
-            logPrintln("[DISPLAY] FRAME");
-            logPrintf("HEX   : %s\n", hex.c_str());
-            logPrintf("INFO  : %s\n", info.c_str());
+            Serial.Println("[DISPLAY] FRAME");
+            Serial.Printf("HEX   : %s\n", hex.c_str());
+            Serial.Printf("INFO  : %s\n", info.c_str());
             
             lastLoggedDisplayFrame = d;
             lastLoggedDisplayFrameValid = true;
@@ -690,9 +697,19 @@ void sensorPoll() {
         i++;
       }
     }
+    // Shift remaining bytes to prevent dropping partial frames
+    if (i < dispRxLen) {
+      size_t remaining = dispRxLen - i;
+      memmove(dispRxBuf, &dispRxBuf[i], remaining);
+      dispRxLen = remaining;
+    } else {
+      dispRxLen = 0;
+    }
     
-    // Clear processed buffer
-    dispRxLen = 0;
+    // If we're processing due to a gap timeout, any remaining partial frame is dead
+    if (dispShouldProcess && dispRxLen < FRAME_LEN) {
+      dispRxLen = 0;
+    }
   }
 }
 

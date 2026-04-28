@@ -1,6 +1,6 @@
 #include "controll.h"
 #include "config.h"
-#include "logger.h"
+
 #include "crash_monitor.h"
 #include "data.h"
 #include "ir_health.h"
@@ -21,6 +21,7 @@
 #endif
 
 #include <cstring>
+#include "rtos_common.h"
 
 const uint16_t IR_LED_PIN = 10;  // IO10 — ESP32-C3
 const bool INVERTED = false;
@@ -157,7 +158,7 @@ static bool irRmtInitIfPossible() {
     s_ir_rmt_tx_chan = nullptr;
     if (!s_ir_rmt_logged_failure) {
       s_ir_rmt_logged_failure = true;
-      logPrintf("[Controll] IR RMT TX init failed: rmt_new_tx_channel err=%s (%d)\n", esp_err_to_name(err), (int)err);
+      Serial.Printf("[Controll] IR RMT TX init failed: rmt_new_tx_channel err=%s (%d)\n", esp_err_to_name(err), (int)err);
     }
     if (err == ESP_ERR_NOT_FOUND) {
       s_ir_rmt_disabled = true;
@@ -174,7 +175,7 @@ static bool irRmtInitIfPossible() {
     s_ir_rmt_copy_encoder = nullptr;
     if (!s_ir_rmt_logged_failure) {
       s_ir_rmt_logged_failure = true;
-      logPrintf("[Controll] IR RMT TX init failed: rmt_new_copy_encoder err=%s (%d)\n", esp_err_to_name(err), (int)err);
+      Serial.Printf("[Controll] IR RMT TX init failed: rmt_new_copy_encoder err=%s (%d)\n", esp_err_to_name(err), (int)err);
     }
     xSemaphoreGive(s_ir_rmt_init_mutex);
     return false;
@@ -193,7 +194,7 @@ static bool irRmtInitIfPossible() {
     s_ir_rmt_copy_encoder = nullptr;
     if (!s_ir_rmt_logged_failure) {
       s_ir_rmt_logged_failure = true;
-      logPrintf("[Controll] IR RMT TX init failed: rmt_apply_carrier err=%s (%d)\n", esp_err_to_name(err), (int)err);
+      Serial.Printf("[Controll] IR RMT TX init failed: rmt_apply_carrier err=%s (%d)\n", esp_err_to_name(err), (int)err);
     }
     xSemaphoreGive(s_ir_rmt_init_mutex);
     return false;
@@ -207,7 +208,7 @@ static bool irRmtInitIfPossible() {
     s_ir_rmt_copy_encoder = nullptr;
     if (!s_ir_rmt_logged_failure) {
       s_ir_rmt_logged_failure = true;
-      logPrintf("[Controll] IR RMT TX init failed: rmt_enable err=%s (%d)\n", esp_err_to_name(err), (int)err);
+      Serial.Printf("[Controll] IR RMT TX init failed: rmt_enable err=%s (%d)\n", esp_err_to_name(err), (int)err);
     }
     xSemaphoreGive(s_ir_rmt_init_mutex);
     return false;
@@ -231,7 +232,7 @@ static bool irRmtSendKelvinatorState(const uint8_t* state, uint16_t repeat) {
   size_t count = 0;
 
   for (uint16_t r = 0; r <= repeat; r++) {
-    logPrintf("[IR-RMT] Building frame repeat %d/%d (count before: %u)\n", (int)r, (int)repeat, (unsigned)count);
+    Serial.Printf("[IR-RMT] Building frame repeat %d/%d (count before: %u)\n", (int)r, (int)repeat, (unsigned)count);
     
     // Command Block #1
     irRmtAppendMarkSpace(symbols, count, kIrRmtMaxFrameSymbols, kHdrMark, kHdrSpace);
@@ -261,13 +262,13 @@ static bool irRmtSendKelvinatorState(const uint8_t* state, uint16_t repeat) {
     }
     irRmtAppendMarkSpace(symbols, count, kIrRmtMaxFrameSymbols, kBitMark, kGapSpace * 2);
     
-    logPrintf("[IR-RMT] Built frame repeat %d/%d (count after: %u)\n", (int)r, (int)repeat, (unsigned)count);
+    Serial.Printf("[IR-RMT] Built frame repeat %d/%d (count after: %u)\n", (int)r, (int)repeat, (unsigned)count);
   }
 
-  logPrintf("[IR-RMT] Total symbols built: %u (max: %u)\n", (unsigned)count, (unsigned)kIrRmtMaxFrameSymbols);
+  Serial.Printf("[IR-RMT] Total symbols built: %u (max: %u)\n", (unsigned)count, (unsigned)kIrRmtMaxFrameSymbols);
   
   if (count == 0 || count >= kIrRmtMaxFrameSymbols) {
-    logPrintf("[IR-RMT] ERROR: count overflow or empty (%u)\n", (unsigned)count);
+    Serial.Printf("[IR-RMT] ERROR: count overflow or empty (%u)\n", (unsigned)count);
     return false;
   }
 
@@ -276,16 +277,16 @@ static bool irRmtSendKelvinatorState(const uint8_t* state, uint16_t repeat) {
   tx_config.flags.eot_level = 0;
   tx_config.flags.queue_nonblocking = 0;
   
-  logPrintf("[IR-RMT] Transmitting %u symbols (%u bytes)...\n", (unsigned)count, (unsigned)(count * sizeof(rmt_symbol_word_t)));
+  Serial.Printf("[IR-RMT] Transmitting %u symbols (%u bytes)...\n", (unsigned)count, (unsigned)(count * sizeof(rmt_symbol_word_t)));
   esp_err_t err = rmt_transmit(s_ir_rmt_tx_chan, s_ir_rmt_copy_encoder, symbols, count * sizeof(rmt_symbol_word_t), &tx_config);
   if (err != ESP_OK) {
-    logPrintf("[IR-RMT] rmt_transmit failed: %s (%d)\n", esp_err_to_name(err), (int)err);
+    Serial.Printf("[IR-RMT] rmt_transmit failed: %s (%d)\n", esp_err_to_name(err), (int)err);
     return false;
   }
   
-  logPrintf("[IR-RMT] Waiting for transmit to complete...\n");
+  Serial.Printf("[IR-RMT] Waiting for transmit to complete...\n");
   (void)rmt_tx_wait_all_done(s_ir_rmt_tx_chan, -1);
-  logPrintln("[IR-RMT] Transmit complete!");
+  Serial.Println("[IR-RMT] Transmit complete!");
 
   return true;
 }
@@ -318,7 +319,7 @@ static inline void irSendCriticalEnd() {}
 #endif
 
 void send_state(const uint8_t st[16]) {
-  logPrintln("[IR] Sending command...");
+  Serial.Println("[IR] Sending command...");
   
   // Reset WDT sebelum IR send
   esp_task_wdt_reset();
@@ -329,30 +330,30 @@ void send_state(const uint8_t st[16]) {
   bool sentViaRmt = false;
 #if defined(ARDUINO_ARCH_ESP32)
   if (irRmtInitIfPossible()) {
-    logPrintf("[IR] RMT available, attempting to send with REPEAT_COUNT=%d...\n", (int)REPEAT_COUNT);
+    Serial.Printf("[IR] RMT available, attempting to send with REPEAT_COUNT=%d...\n", (int)REPEAT_COUNT);
     irSendCriticalBegin();
     sentViaRmt = irRmtSendKelvinatorState(st, REPEAT_COUNT);
     irSendCriticalEnd();
     if (!sentViaRmt) {
-      logPrintln("[IR] RMT send failed, falling back to library send");
+      Serial.Println("[IR] RMT send failed, falling back to library send");
     } else {
-      logPrintln("[IR] RMT send succeeded!");
+      Serial.Println("[IR] RMT send succeeded!");
     }
   } else {
-    logPrintln("[IR] RMT not available, will use library send");
+    Serial.Println("[IR] RMT not available, will use library send");
   }
 #endif
 
   if (!sentViaRmt) {
-    logPrintf("[IR] Using library send (1 main + %d repeats = %d total sends)\n", (int)REPEAT_COUNT, (int)(1 + REPEAT_COUNT));
+    Serial.Printf("[IR] Using library send (1 main + %d repeats = %d total sends)\n", (int)REPEAT_COUNT, (int)(1 + REPEAT_COUNT));
     
     irSendCriticalBegin();
     irsend.sendKelvinator(st, 16);
     irSendCriticalEnd();
-    logPrintln("[IR] Library send #1 (main) done");
+    Serial.Println("[IR] Library send #1 (main) done");
 
     for (uint8_t i = 0; i < REPEAT_COUNT; i++) {
-      logPrintf("[IR] Starting repeat %d/%d\n", (int)(i + 1), (int)REPEAT_COUNT);
+      Serial.Printf("[IR] Starting repeat %d/%d\n", (int)(i + 1), (int)REPEAT_COUNT);
       
       if (GAP_US >= 1000) delay(GAP_US / 1000);
       const uint32_t gapRem = GAP_US % 1000;
@@ -363,7 +364,7 @@ void send_state(const uint8_t st[16]) {
       irsend.sendKelvinator(st, 16);
       irSendCriticalEnd();
       
-      logPrintf("[IR] Library send #%d (repeat) done\n", (int)(i + 2));
+      Serial.Printf("[IR] Library send #%d (repeat) done\n", (int)(i + 2));
     }
   }
   
@@ -371,8 +372,8 @@ void send_state(const uint8_t st[16]) {
   esp_task_wdt_reset();
   yield();
   
-  logPrintf("[IR] Command sent successfully (%s path, REPEAT_COUNT=%d)\n", sentViaRmt ? "RMT" : "LIB", (int)REPEAT_COUNT);
-  logPrintf("[IR] TX path: %s\n", sentViaRmt ? "RMT" : "LIB");
+  Serial.Printf("[IR] Command sent successfully (%s path, REPEAT_COUNT=%d)\n", sentViaRmt ? "RMT" : "LIB", (int)REPEAT_COUNT);
+  Serial.Printf("[IR] TX path: %s\n", sentViaRmt ? "RMT" : "LIB");
 }
 
 static void ensurePowerOn() {
@@ -382,8 +383,8 @@ static void ensurePowerOn() {
 }
 
 void setFullState(uint8_t temp, uint8_t mode, uint8_t fan) {
-  logPrintf(
-    "[IR] Set FULL state: %d°C, mode=%d, fan=%d\n",
+  Serial.Printf(
+    "[IR] Set FULL state: %dC, mode=%d, fan=%d\n",
     temp, mode, fan
   );
 
@@ -408,7 +409,7 @@ void update_mode(uint8_t mode) {
 // === FUNGSI: SET FAN MENGGUNAKAN HYBRID (LIBRARY + CUSTOM BYTE) ===
 // MEDIUM menggunakan custom byte replacement, yang lain pakai library
 void update_fan(const char* fanSpeed) {
-  logPrintf("[IR] Set fan speed: %s\n", fanSpeed);
+  Serial.Printf("[IR] Set fan speed: %s\n", fanSpeed);
   
   // Ensure power is ON
   ensurePowerOn();
@@ -417,14 +418,11 @@ void update_fan(const char* fanSpeed) {
   ac.setRaw(cur);
   ac.setPower(true);
 
-  // ═══════════════════════════════════════════════════════════════
-  // LOW/MIN: Gunakan Custom Byte Patch
-  // Alasan: Setelah MEDIUM custom patch, library kadang tidak mengubah
-  // byte0 sehingga transisi MEDIUM → LOW bisa "nyangkut" di MEDIUM.
-  // Jadi LOW harus memaksa byte0 kembali ke kode LOW.
-  // ═══════════════════════════════════════════════════════════════
+  // LOW/MIN: use custom byte patch
+  // After the MEDIUM custom patch, the library may keep byte0 unchanged.
+  // LOW must force byte0 back to the LOW code.
   if (strcasecmp(fanSpeed, "LOW") == 0 || strcasecmp(fanSpeed, "MIN") == 0) {
-    logPrintln("[IR] Using custom byte patch for LOW");
+    Serial.Println("[IR] Using custom byte patch for LOW");
 
     ac.setQuiet(false);
     ac.setTurbo(false);
@@ -442,7 +440,7 @@ void update_fan(const char* fanSpeed) {
     memcpy(cur, ac.getRaw(), 16);
     send_state(cur);
 
-    logPrintf("[IR] LOW fan sent (custom byte0=0x%02X)\n", cur[0]);
+    Serial.Printf("[IR] LOW fan sent (custom byte0=0x%02X)\n", cur[0]);
     return;
   }
   
@@ -451,7 +449,7 @@ void update_fan(const char* fanSpeed) {
   // Hanya ubah byte 0 (fan identifier) tanpa mengubah byte lain
   // ═══════════════════════════════════════════════════════════════
   if (strcasecmp(fanSpeed, "MED") == 0 || strcasecmp(fanSpeed, "MEDIUM") == 0) {
-    logPrintln("[IR] Using custom byte replacement for MEDIUM");
+    Serial.Println("[IR] Using custom byte replacement for MEDIUM");
     
     uint8_t patched[16];
     memcpy(patched, ac.getRaw(), 16);
@@ -466,7 +464,7 @@ void update_fan(const char* fanSpeed) {
     memcpy(cur, ac.getRaw(), 16);
     send_state(cur);
     
-    logPrintf("[IR] MEDIUM fan sent (custom byte0=0x%02X)\n", cur[0]);
+    Serial.Printf("[IR] MEDIUM fan sent (custom byte0=0x%02X)\n", cur[0]);
     return;
   }
 
@@ -476,7 +474,7 @@ void update_fan(const char* fanSpeed) {
   // Tetap preserve suhu/mode karena basisnya dari cur.
   // ═══════════════════════════════════════════════════════════════
   if (strcasecmp(fanSpeed, "TURBO") == 0) {
-    logPrintln("[IR] Using custom byte patch for TURBO");
+    Serial.Println("[IR] Using custom byte patch for TURBO");
 
     // Start from current state, set fan max via library first.
     ac.setQuiet(false);
@@ -496,7 +494,7 @@ void update_fan(const char* fanSpeed) {
     memcpy(cur, ac.getRaw(), 16);
     send_state(cur);
 
-    logPrintf("[IR] TURBO fan sent (custom byte2=0x%02X)\n", cur[2]);
+    Serial.Printf("[IR] TURBO fan sent (custom byte2=0x%02X)\n", cur[2]);
     return;
   }
   
@@ -524,7 +522,7 @@ void update_fan(const char* fanSpeed) {
     ac.setFan(kKelvinatorFanAuto);  // Fan speed 0 (auto)
   }
   else {
-    logPrintf("[IR] Unknown fan speed: %s\n", fanSpeed);
+    Serial.Printf("[IR] Unknown fan speed: %s\n", fanSpeed);
     return;
   }
   
@@ -532,7 +530,7 @@ void update_fan(const char* fanSpeed) {
   memcpy(cur, ac.getRaw(), 16);
   send_state(cur);
   
-  logPrintf("[IR] Fan speed %s sent successfully\n", fanSpeed);
+  Serial.Printf("[IR] Fan speed %s sent successfully\n", fanSpeed);
 }
 
 void set_temp(uint8_t t) {
@@ -561,20 +559,20 @@ void controllInit() {
   }
 
   if (irRmtInitIfPossible()) {
-    logPrintf("[Controll] IR RMT TX: enabled (res %luHz, mem %u symbols)\n",
+    Serial.Printf("[Controll] IR RMT TX: enabled (res %luHz, mem %u symbols)\n",
               (unsigned long)kIrRmtResolutionHz,
               (unsigned)kIrRmtChannelMemSymbols);
   } else {
-    logPrintf("[Controll] IR RMT TX: not available, using software timing\n");
+    Serial.Printf("[Controll] IR RMT TX: not available, using software timing\n");
   }
 #endif
 
-  logPrintln("[Controll] IR initialized on IO10");
+  Serial.Println("[Controll] IR initialized on IO10");
 }
 
 void controllHandleCommand(const char* payload, size_t length) {
   if (!payload || length == 0 || length > 1024) {
-    logPrintln("[Controll] Invalid payload");
+    Serial.Println("[Controll] Invalid payload");
     return;
   }
 
@@ -582,7 +580,7 @@ void controllHandleCommand(const char* payload, size_t length) {
   DeserializationError error = deserializeJson(doc, payload, length);
   if (error) {
     Serial.print("[Controll] JSON error: ");
-    logPrintln(error.c_str());
+    Serial.Println(error.c_str());
     return;
   }
 
@@ -635,7 +633,7 @@ void controllHandleCommand(const char* payload, size_t length) {
   // Log jika power command ada tapi di-skip karena ada settings lain
   if (doc.containsKey("power") && !isPowerOnlyCommand) {
     bool powerOn = doc["power"].as<bool>();
-    logPrintf("[Controll] Power=%s (included in full state, skip separate command)\n", 
+    Serial.Printf("[Controll] Power=%s (included in full state, skip separate command)\n", 
               powerOn ? "ON" : "OFF");
   }
 
@@ -659,12 +657,12 @@ void controllHandleCommand(const char* payload, size_t length) {
       powerOn = (powerValue.as<int>() != 0);
     }
     else {
-      logPrintln("[Controll] Unsupported power value type");
+      Serial.Println("[Controll] Unsupported power value type");
       return;
     }
 
-    logPrintf(
-      "[Controll] ✓ Executing: AC %s\n",
+    Serial.Printf(
+      "[Controll] Executing: AC %s\n",
       powerOn ? "ON" : "OFF"
     );
 
@@ -681,9 +679,9 @@ void controllHandleCommand(const char* payload, size_t length) {
     String modeStr = String(doc["mode"].as<const char*>());
     modeStr.toUpperCase();
 
-    logPrintf("[Controll] Mode command: %s\n", modeStr.c_str());
+    Serial.Printf("[Controll] Mode command: %s\n", modeStr.c_str());
 
-    ac.setPower(true);   // 🔑 WAJIB: pastikan ON
+    ac.setPower(true);   // ensure ON
 
     if (modeStr == "COLD" || modeStr == "COOL") {
       ac.setMode(kKelvinatorCool);
@@ -706,7 +704,7 @@ void controllHandleCommand(const char* payload, size_t length) {
       needSend = true;
     }
     else {
-      logPrintf("[Controll] Invalid mode: %s\n", modeStr.c_str());
+      Serial.Printf("[Controll] Invalid mode: %s\n", modeStr.c_str());
     }
   }
 
@@ -715,14 +713,14 @@ void controllHandleCommand(const char* payload, size_t length) {
   // =================================================
   if (doc.containsKey("temp")) {
     int t = doc["temp"].as<int>();
-    logPrintf("[Controll] Set temp command: %d°C\n", t);
+    Serial.Printf("[Controll] Set temp command: %dC\n", t);
 
     if (t >= 16 && t <= 30) {
-      ac.setPower(true);          // 🔑 WAJIB
+      ac.setPower(true);          // ensure ON
       ac.setTemp((uint8_t)t);
       needSend = true;
     } else {
-      logPrintf("[Controll] Temp out of range: %d (valid: 16-30)\n", t);
+      Serial.Printf("[Controll] Temp out of range: %d (valid: 16-30)\n", t);
     }
   }
 
@@ -738,7 +736,7 @@ void controllHandleCommand(const char* payload, size_t length) {
     fanStr.trim();
     hasFanCommand = true;
 
-    logPrintf("[Controll] Fan command: %s\n", fanStr.c_str());
+    Serial.Printf("[Controll] Fan command: %s\n", fanStr.c_str());
   }
 
   // =================================================
@@ -761,7 +759,7 @@ void controllHandleCommand(const char* payload, size_t length) {
         // Re-apply ke library agar checksum/dup-block konsisten
         ac.setRaw(patched);
         memcpy(cur, ac.getRaw(), 16);
-        logPrintf("[Controll] MEDIUM fan applied (custom byte0=0x%02X)\n", cur[0]);
+        Serial.Printf("[Controll] MEDIUM fan applied (custom byte0=0x%02X)\n", cur[0]);
       } else if (fanStr == "LOW" || fanStr == "MIN") {
         // LOW: Force LOW identifier supaya transisi dari MEDIUM tidak nyangkut.
         ac.setQuiet(false);
@@ -776,7 +774,7 @@ void controllHandleCommand(const char* payload, size_t length) {
 
         ac.setRaw(patched);
         memcpy(cur, ac.getRaw(), 16);
-        logPrintf("[Controll] LOW fan applied (custom byte0=0x%02X)\n", cur[0]);
+        Serial.Printf("[Controll] LOW fan applied (custom byte0=0x%02X)\n", cur[0]);
       } else if (fanStr == "TURBO") {
         // TURBO: patch byte agar AC benar-benar TURBO (bukan HIGH)
         ac.setQuiet(false);
@@ -792,7 +790,7 @@ void controllHandleCommand(const char* payload, size_t length) {
 
         ac.setRaw(patched);
         memcpy(cur, ac.getRaw(), 16);
-        logPrintf("[Controll] TURBO fan applied (custom byte0=0x39 byte2=0x%02X)\n", cur[2]);
+        Serial.Printf("[Controll] TURBO fan applied (custom byte0=0x39 byte2=0x%02X)\n", cur[2]);
       } else {
         // Untuk fan speed lain, gunakan library
         if (fanStr == "QUIET") {
@@ -812,7 +810,7 @@ void controllHandleCommand(const char* payload, size_t length) {
         }
         
         memcpy(cur, ac.getRaw(), 16);
-        logPrintf("[Controll] Fan %s applied via library\n", fanStr.c_str());
+        Serial.Printf("[Controll] Fan %s applied via library\n", fanStr.c_str());
       }
     } else {
       // Tidak ada fan command, ambil state normal
@@ -833,6 +831,30 @@ void controllHandleCommand(const char* payload, size_t length) {
   }
 
   if (!powerHandled) {
-    logPrintln("[Controll] No valid command found in payload");
+    Serial.Println("[Controll] No valid command found in payload");
   }
+}
+
+bool controllEnqueueCommand(const char* payload, size_t len) {
+  if (!payload || len == 0) return false;
+
+  if (!g_irCmdQueue) {
+    // Ensure IR commands are executed only by CtrlTask.
+    // If the queue isn't ready yet, create it and enqueue; do NOT send IR inline.
+    g_irCmdQueue = xQueueCreate(IR_CMD_QUEUE_LEN, sizeof(IrCmdMsg));
+    if (!g_irCmdQueue) {
+      Serial.println("[IR] Failed to create command queue");
+      return false;
+    }
+  }
+
+  IrCmdMsg msg;
+  if (len >= IR_CMD_STR_MAX) len = IR_CMD_STR_MAX - 1;
+  memcpy(msg.payload, payload, len);
+  msg.payload[len] = '\0';
+  msg.len = len;
+
+  bool sent = (xQueueSend(g_irCmdQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE);
+  if (!sent) Serial.Println("[IR] Queue full, command dropped");
+  return sent;
 }

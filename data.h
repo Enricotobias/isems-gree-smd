@@ -51,7 +51,6 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok);
 void dataPublishSetting();
 bool dataPublishInfo();
 void publishStatus(const String& status);
-void dataPublishDiagnostics();
 bool dataPublishRaw(const String& topic, const String& payload);
 
 // Fungsi Helper

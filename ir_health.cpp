@@ -1,7 +1,8 @@
 #include "ir_health.h"
 #include "sensor.h"
-#include "logger.h"
+
 #include "data.h"
+#include "config.h"
 #include <Arduino.h>
 
 static IRHealthStats stats = {0, 0, 0, 0, false, "", "", "", 0};
@@ -19,7 +20,7 @@ static void autoEnableIfDisplayReady() {
 
   waitingFirstValidDisplayFrame = false;
   healthEnabled = true;
-  logPrintln("[IR Health] Display frame detected; IR validation enabled");
+  Serial.Println("[IR Health] Display frame detected; IR validation enabled");
 }
 
 static String normalizeFanSpeedLabel(const String& fan) {
@@ -81,7 +82,7 @@ void irHealthInit() {
   expectedHasTemp = false;
   observedRelevantChange = false;
   
-  logPrintln("[IR Health] Initialized");
+  Serial.Println("[IR Health] Initialized");
 }
 
 void irHealthSetExpectedState(bool hasPower, bool power,
@@ -119,7 +120,7 @@ void irHealthSetExpectedState(bool hasPower, bool power,
   expectingResponse = true;
   observedRelevantChange = false;
   
-  logPrintf("[IR Health] Expected: power=%s mode=%s fan=%s set_temp=%d\n",
+  Serial.Printf("[IR Health] Expected: power=%s mode=%s fan=%s set_temp=%d\n",
             power ? "ON" : "OFF", mode.c_str(), fan.c_str(), setTemp);
 }
 
@@ -147,12 +148,12 @@ void irHealthCheckResponse() {
                         " set_temp=" + String(expectedSetTemp);
     stats.lastActual = "TIMEOUT";
 
-    logPrintln("╔═══════════════════════════════════════╗");
-    logPrintln("║ ⚠️ IR LED HEALTH: TIMEOUT             ║");
-    logPrintln("╚═══════════════════════════════════════╝");
-    logPrintf("[IR Health] Expected: %s\n", stats.lastExpected.c_str());
-    logPrintln("[IR Health] Actual: Timeout waiting for display response");
-    logPrintf("[IR Health] Success Rate: %.1f%% (%s)\n",
+    Serial.Println("╔═══════════════════════════════════════╗");
+    Serial.Println("║ ⚠️ IR LED HEALTH: TIMEOUT             ║");
+    Serial.Println("╚═══════════════════════════════════════╝");
+    Serial.Printf("[IR Health] Expected: %s\n", stats.lastExpected.c_str());
+    Serial.Println("[IR Health] Actual: Timeout waiting for display response");
+    Serial.Printf("[IR Health] Success Rate: %.1f%% (%s)\n",
               stats.getSuccessRate(), stats.getHealthStatus().c_str());
 
     String ackMsg = "Display TIMEOUT - Expected: " + stats.lastExpected +
@@ -171,7 +172,7 @@ void irHealthCheckResponse() {
       // Throttle warning log - hanya print setiap 1 menit
       unsigned long now = millis();
       if (now - lastNoFrameWarningMs >= NO_FRAME_WARNING_INTERVAL_MS) {
-        logPrintln("[IR Health] ⚠ No valid display frame for health check");
+        Serial.Println("[IR Health] ⚠ No valid display frame for health check");
         lastNoFrameWarningMs = now;
       }
     }
@@ -310,12 +311,12 @@ void irHealthReset() {
   stats.lastCommandMs = 0;
   expectingResponse = false;
   
-  logPrintln("[IR Health] Statistics reset");
+  Serial.Println("[IR Health] Statistics reset");
 }
 
 void irHealthSetEnabled(bool enabled) {
   healthEnabled = enabled;
-  logPrintf("[IR Health] Monitoring %s\n", enabled ? "enabled" : "disabled");
+  Serial.Printf("[IR Health] Monitoring %s\n", enabled ? "enabled" : "disabled");
 }
 
 bool irHealthIsEnabled() {
