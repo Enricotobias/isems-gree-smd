@@ -1,6 +1,10 @@
 # ESP32 Gree AC Control System (SMD Variant)
 
-Sistem kontrol AC Gree versi SMD menggunakan ESP32-C3 dengan komunikasi IR dan monitoring melalui MQTT over SSL/TLS. Program ini dapat mengontrol AC secara otomatis berdasarkan jadwal dan suhu, serta dapat dikontrol manual melalui MQTT commands.
+Sistem kontrol AC Gree versi SMD menggunakan ESP32-C3 dengan komunikasi IR dan monitoring melalui MQTT over SSL/TLS. Program ini mengontrol AC secara otomatis berdasarkan jadwal dan dapat dikontrol manual melalui MQTT commands.
+
+**Firmware:** `2.4.7` - Schedule binary V2, maksimal 10 periode per hari,
+atomic replace/insert, periode overnight, transisi periode kontinu, dan retained
+setting per hari.
 
 > **Perbedaan dari varian standar (`gree/`):**
 > - Berjalan di ESP32-C3 (SMD package, tanpa pin tambahan)
@@ -199,6 +203,11 @@ Dikirim saat connect (online) dan disconnect (offline/LWT).
 
 ### **3. Setting Topic**
 
+Payload dasar setting hanya berisi konfigurasi umum seperti `automation`.
+Jadwal mingguan tidak lagi disisipkan ke topic ini. Jadwal dipublish sebagai
+retained topic terpisah per hari agar update satu hari tidak mengirim ulang
+hingga 70 periode sekaligus.
+
 **Topic:** `isems/devices/{device_id}/setting`
 **Retained:** Ya
 **Dikirim:** Saat startup dan setiap perubahan konfigurasi
@@ -206,41 +215,39 @@ Dikirim saat connect (online) dan disconnect (offline/LWT).
 **Payload:**
 ```json
 {
-  "automation": true,
-  "max_temp": 28,
-  "min_temp": 18,
-  "set_temp": 24,
-  "set_mode": "COOL",
-  "default_fan": "AUTO",
-  "temp_cooldown": 300,
-  "system_mode": "auto",
-  "pause_reason": "",
-  "daily": [
-    {
-      "day": "senin",
-      "type": "part_time",
-      "waktu": { "mulai": "08:00", "selesai": "17:00" }
-    },
-    { "day": "selasa", "type": "full_time" },
-    { "day": "sabtu", "type": "libur" }
+  "automation": true
+}
+```
+
+Firmware memublikasikan satu hari per retained topic berikut:
+
+```text
+isems/devices/{device_id}/setting/day/0
+...
+isems/devices/{device_id}/setting/day/6
+```
+
+Contoh payload topic `/setting/day/1`:
+
+```json
+{
+  "day": 1,
+  "type": "parttime",
+  "data": [
+    { "start": "08:00", "end": "16:59", "mode": "COOL", "fan": "MEDIUM", "set_temp": 24 }
   ]
 }
 ```
 
-| Field | Tipe | Keterangan |
-|-------|------|-----------|
-| `automation` | bool | Aktifkan/nonaktifkan automation |
-| `max_temp` | int | Suhu maksimal sebelum AC dinyalakan (°C) |
-| `min_temp` | int | Suhu minimal sebelum AC dimatikan (°C) |
-| `set_temp` | int | Target suhu saat AC ON (°C) |
-| `set_mode` | string | Mode AC default saat automation menyalakan AC |
-| `default_fan` | string | Kecepatan kipas default (`AUTO`/`LOW`/`MED`/`HIGH`) |
-| `temp_cooldown` | int | Cooldown (detik) setelah AC dimatikan/dinyalakan |
-| `system_mode` | string | Mode sistem: `auto`, `pause`, `manual` |
-| `pause_reason` | string | Alasan pause bila `system_mode = "pause"` |
-| `daily` | array | Jadwal harian 7 hari |
-| `daily[].type` | string | `full_time`, `part_time`, atau `libur` |
-| `daily[].waktu` | object | `mulai` & `selesai` (hanya untuk `part_time`) |
+Nomor hari menggunakan `0=Minggu` sampai `6=Sabtu`. Server menyusun satu
+minggu dari ketujuh retained topic. Topic hari yang belum diterima dianggap
+belum diketahui dan tidak boleh menghapus hari lain. Firmware memublikasikan
+ulang seluruh hari setelah boot dan hanya hari yang berubah setelah command
+schedule berhasil.
+
+Field legacy `min_temp`, `max_temp`, serta `temp_cooldown` boleh dikirim oleh
+command setting lama untuk kompatibilitas, tetapi tidak diproses sebagai kontrol
+suhu dan tidak dipublish kembali.
 
 ---
 
@@ -349,6 +356,9 @@ Setiap baris log Serial dikirim ke topic ini sebagai plain string bila `mqtt_log
 
 Semua field opsional.
 
+`min_temp` dan `max_temp` pada command lama tetap diterima, tetapi diabaikan.
+Automation mengikuti `set_temp`, `mode`, dan `fan` dari periode schedule.
+
 ---
 
 ### **B. Schedule Command**
@@ -356,13 +366,72 @@ Semua field opsional.
 **Topic:** `isems/command/{device_id}/schedule`
 
 ```json
+[
+  {
+    "day": 1,
+    "operation": "replace",
+    "type": "parttime",
+    "data": [
+      { "start": "08:00", "end": "16:59", "mode": "COOL", "fan": "MEDIUM", "set_temp": 24 }
+    ]
+  }
+]
+```
+
+`operation` opsional. Jika tidak dikirim, firmware menggunakan `replace`.
+Replace hanya menimpa hari yang disebutkan dan menerima maksimal 10 periode
+per hari.
+
+Insert menambahkan periode tanpa menghapus periode lama:
+
+```json
+[
+  {
+    "day": 5,
+    "operation": "insert",
+    "type": "parttime",
+    "data": [
+      { "start": "23:00", "end": "03:00", "mode": "COOL", "fan": "LOW", "set_temp": 25 }
+    ]
+  }
+]
+```
+
+Periode lintas tengah malam dimiliki oleh hari mulai. Contoh di atas tetap
+aktif pada Sabtu hingga `03:00` walaupun jadwal Sabtu bertipe `offtime`.
+Pengiriman ulang insert yang identik dianggap berhasil tanpa membuat duplikat.
+
+Semua hari dalam satu command diproses secara atomik. Seluruh command ditolak
+dan jadwal lama dipertahankan jika ditemukan waktu tidak valid, operasi tidak
+dikenal, lebih dari 10 periode, overlap, kekurangan blok heap untuk parsing,
+atau kegagalan penyimpanan LittleFS.
+
+Contoh ACK berhasil:
+
+```json
 {
-  "daily": [
-    { "day": "senin", "type": "part_time", "waktu": { "mulai": "08:00", "selesai": "17:00" } },
-    { "day": "sabtu", "type": "libur" }
-  ]
+  "cmd": "schedule",
+  "status": "success",
+  "detail": "Inserted schedule day=5 added=1 total=2",
+  "ts": 12345
 }
 ```
+
+Contoh ACK gagal:
+
+```json
+{
+  "cmd": "schedule",
+  "status": "failed",
+  "detail": "Schedule overlap: day=5 period=1 conflicts_day=6 conflicts_period=0",
+  "ts": 12345
+}
+```
+
+Rentang waktu memakai menit akhir inklusif. Karena itu `00:00-06:59` yang
+dilanjutkan `07:00-16:59` tidak mematikan AC di batas periode; automation hanya
+menyinkronkan mode, fan, dan set temperature yang berubah. Jika periode pertama
+berakhir `06:58`, menit `06:59` tetap menjadi gap OFF normal.
 
 ---
 
@@ -378,6 +447,47 @@ Semua field opsional.
   "fan": "AUTO"
 }
 ```
+
+Top-level key yang dikenali: `power`, `temp`, `mode`, `fan`, `swing`, `sleep`, `turbo`, `lights`, `health`.
+
+#### Swing Command
+
+Mengontrol swing vertical dan horizontal AC. Mendukung beberapa format:
+
+**Boolean (vertical + horizontal sekaligus):**
+```json
+{"swing": true}    // vertical auto sweep + horizontal on
+{"swing": false}   // vertical off + horizontal off
+```
+
+**String (vertical saja):**
+```json
+{"swing": "auto"}          // vertical auto sweep
+{"swing": "on"}            // vertical auto (alias)
+{"swing": "off"}           // vertical off + horizontal off
+{"swing": "highest"}       // vertical fixed posisi atas
+{"swing": "upper_middle"}  // vertical fixed posisi atas-tengah
+{"swing": "middle"}        // vertical fixed posisi tengah
+{"swing": "lower_middle"}  // vertical fixed posisi bawah-tengah
+{"swing": "lowest"}        // vertical fixed posisi bawah
+```
+
+**Object (vertical dan horizontal独立):**
+```json
+{"swing": {"vertical": "auto", "horizontal": true}}
+{"swing": {"vertical": "middle", "horizontal": false}}
+{"swing": {"vertical": "off"}}                // hanya vertical off
+{"swing": {"horizontal": true}}               // hanya horizontal on
+{"swing": {"horizontal": false}}              // hanya horizontal off
+```
+
+**Dikombinasikan dengan command lain:**
+```json
+{"power": true, "mode": "COOL", "temp": 24, "swing": "auto"}
+{"fan": "HIGH", "swing": {"vertical": "lowest", "horizontal": true}}
+```
+
+> **Catatan protokol:** Ketika horizontal swing aktif, AC otomatis mengaktifkan auto-sweep vertical (keterbatasan protokol Kelvinator/Gree). Untuk menggunakan vertical fixed position, horizontal harus dimatikan terlebih dahulu.
 
 Mengirim command ini akan memicu `manual_override` di activity log.
 
@@ -428,7 +538,42 @@ Payload: `"get"`. Meminta device mempublikasikan payload info.
 
 **Topic:** `isems/command/{device_id}/update`
 
-Memicu OTA firmware update (lihat ota.cpp).
+Update melalui manifest:
+
+```json
+{
+  "action": "manifest",
+  "manifest_url": "https://example.com/manifest.json"
+}
+```
+
+`action` boleh dihilangkan untuk kompatibilitas payload lama. Manifest wajib
+berisi `version`, `url`, dan checksum `md5` 32 karakter.
+
+Update langsung dari binary:
+
+```json
+{
+  "action": "direct",
+  "binary_url": "https://example.com/firmware.bin",
+  "md5": "0123456789abcdef0123456789abcdef"
+}
+```
+
+`download_url` atau `url` juga diterima sebagai pengganti `binary_url`.
+
+Rollback ke slot OTA sebelumnya:
+
+```json
+{
+  "action": "rollback",
+  "confirm": true
+}
+```
+
+Rollback tidak mengunduh firmware dan hanya dapat memilih slot OTA sebelumnya.
+Firmware baru divalidasi setelah task RTOS stabil selama 60 detik dan heap
+memenuhi batas aman. MQTT tidak menjadi syarat health validation.
 
 ---
 

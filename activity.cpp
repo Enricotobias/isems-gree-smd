@@ -8,7 +8,7 @@
 // ==========================================
 // GLOBAL STATE TRACKING
 // ==========================================
-static BPFrame lastKnownState = {false, false, 0, "", "", 0, "", "", "", ""};
+static BPFrame lastKnownState = {};
 static bool stateInitialized = false;
 
 // Setpoint temperature (comes from DisplayFrame, not BPFrame)

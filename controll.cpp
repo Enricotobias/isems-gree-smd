@@ -28,9 +28,7 @@ const bool INVERTED = false;
 IRsend irsend(IR_LED_PIN, INVERTED, true);
 IRKelvinatorAC ac(IR_LED_PIN);
 
-uint8_t ST_ON[16]  = {0x29,0x08,0x20,0x50,0x00,0xC0,0x00,0x70,0x29,0x08,0x20,0x70,0x00,0x00,0x30,0xE0};
-uint8_t ST_OFF[16] = {0x21,0x08,0x20,0x50,0x00,0xC0,0x00,0xF0,0x21,0x08,0x20,0x70,0x00,0x00,0x30,0x60};
-uint8_t cur[16] = {0x21,0x08,0x20,0x50,0x00,0xC0,0x00,0xF0,0x21,0x08,0x20,0x70,0x00,0x00,0x30,0x60};
+uint8_t cur[16] = {0x61,0x08,0x20,0x50,0x11,0xC0,0x00,0x00,0x61,0x08,0x20,0x70,0x00,0x00,0x30,0x60};
 
 // IR repeat untuk meningkatkan peluang diterima AC.
 // Total burst = 1x send utama + REPEAT_COUNT x repeat.
@@ -335,51 +333,40 @@ void send_state(const uint8_t st[16]) {
     sentViaRmt = irRmtSendKelvinatorState(st, REPEAT_COUNT);
     irSendCriticalEnd();
     if (!sentViaRmt) {
-      Serial.Println("[IR] RMT send failed, falling back to library send");
-    } else {
-      Serial.Println("[IR] RMT send succeeded!");
+      // RMT init berhasil tapi send gagal — ini tidak seharusnya terjadi.
+      // Reboot untuk reset state RMT.
+      Serial.Println("[IR] FATAL: RMT send failed after successful init — rebooting");
+      delay(200);
+      ESP.restart();
     }
+    Serial.Println("[IR] RMT send succeeded!");
   } else {
-    Serial.Println("[IR] RMT not available, will use library send");
+    // RMT tidak tersedia — seharusnya sudah di-handle di controllInit().
+    // Jika sampai sini berarti ada bug, reboot.
+    Serial.Println("[IR] FATAL: RMT not available at send time — rebooting");
+    delay(200);
+    ESP.restart();
   }
 #endif
-
-  if (!sentViaRmt) {
-    Serial.Printf("[IR] Using library send (1 main + %d repeats = %d total sends)\n", (int)REPEAT_COUNT, (int)(1 + REPEAT_COUNT));
-    
-    irSendCriticalBegin();
-    irsend.sendKelvinator(st, 16);
-    irSendCriticalEnd();
-    Serial.Println("[IR] Library send #1 (main) done");
-
-    for (uint8_t i = 0; i < REPEAT_COUNT; i++) {
-      Serial.Printf("[IR] Starting repeat %d/%d\n", (int)(i + 1), (int)REPEAT_COUNT);
-      
-      if (GAP_US >= 1000) delay(GAP_US / 1000);
-      const uint32_t gapRem = GAP_US % 1000;
-      if (gapRem) delayMicroseconds(gapRem);
-
-      esp_task_wdt_reset();
-      irSendCriticalBegin();
-      irsend.sendKelvinator(st, 16);
-      irSendCriticalEnd();
-      
-      Serial.Printf("[IR] Library send #%d (repeat) done\n", (int)(i + 2));
-    }
-  }
   
   // Reset WDT setelah selesai
   esp_task_wdt_reset();
   yield();
   
-  Serial.Printf("[IR] Command sent successfully (%s path, REPEAT_COUNT=%d)\n", sentViaRmt ? "RMT" : "LIB", (int)REPEAT_COUNT);
-  Serial.Printf("[IR] TX path: %s\n", sentViaRmt ? "RMT" : "LIB");
+  Serial.Printf("[IR] Command sent via RMT (REPEAT_COUNT=%d)\n", (int)REPEAT_COUNT);
 }
 
 static void ensurePowerOn() {
   ac.setRaw(cur);
   ac.setPower(true);
   memcpy(cur, ac.getRaw(), 16);
+}
+
+static void applyPowerFromLibrary(bool powerOn) {
+  ac.setRaw(cur);
+  ac.setPower(powerOn);
+  memcpy(cur, ac.getRaw(), 16);
+  send_state(cur);
 }
 
 void setFullState(uint8_t temp, uint8_t mode, uint8_t fan) {
@@ -558,13 +545,23 @@ void controllInit() {
     (void)esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ir_cpu", &s_ir_pm_lock_cpu_max);
   }
 
-  if (irRmtInitIfPossible()) {
-    Serial.Printf("[Controll] IR RMT TX: enabled (res %luHz, mem %u symbols)\n",
-              (unsigned long)kIrRmtResolutionHz,
-              (unsigned)kIrRmtChannelMemSymbols);
-  } else {
-    Serial.Printf("[Controll] IR RMT TX: not available, using software timing\n");
+  // RMT adalah satu-satunya jalur IR yang diizinkan pada ESP32-C3.
+  // Software bit-bang tidak diperbolehkan karena single-core dan timing kritis.
+  // Jika RMT gagal init, reboot sampai berhasil.
+  static uint8_t rmtRetryCount = 0;
+  const uint8_t RMT_MAX_RETRIES = 5;
+
+  while (!irRmtInitIfPossible()) {
+    rmtRetryCount++;
+    Serial.Printf("[Controll] IR RMT init failed (attempt %d/%d), rebooting...\n",
+              (int)rmtRetryCount, (int)RMT_MAX_RETRIES);
+    delay(500);
+    ESP.restart();
   }
+
+  Serial.Printf("[Controll] IR RMT TX: enabled (res %luHz, mem %u symbols)\n",
+            (unsigned long)kIrRmtResolutionHz,
+            (unsigned)kIrRmtChannelMemSymbols);
 #endif
 
   Serial.Println("[Controll] IR initialized on IO10");
@@ -619,15 +616,21 @@ void controllHandleCommand(const char* payload, size_t length) {
   String expectedFan = hasFan ? doc["fan"].as<String>() : "";
   uint8_t expectedTemp = hasTemp ? doc["temp"].as<uint8_t>() : 0;
   
-  // Set expected state before sending IR
-  irHealthSetExpectedState(hasPower, expectedPower, hasMode, expectedMode, hasFan, expectedFan, hasTemp, expectedTemp);
+  const bool validateStateFields = !(hasPower && !expectedPower);
+
+  // Validate only fields explicitly present in the command. A fan/temp/mode
+  // command without "power" must not inherit the default false value as OFF.
+  irHealthSetExpectedState(hasPower, expectedPower,
+                           validateStateFields && hasMode, expectedMode,
+                           validateStateFields && hasFan, expectedFan,
+                           validateStateFields && hasTemp, expectedTemp);
 
   // ═══════════════════════════════════════════════════════════════════
   // [FIX] Cek apakah command berisi setting lain selain power
   // Jika ada setting lain, SKIP power command terpisah untuk menghindari
   // double IR transmission yang membuat temp/setting tidak ter-apply
   // ═══════════════════════════════════════════════════════════════════
-  bool hasOtherSettings = doc.containsKey("mode") || doc.containsKey("temp") || doc.containsKey("fan");
+  bool hasOtherSettings = doc.containsKey("mode") || doc.containsKey("temp") || doc.containsKey("fan") || doc.containsKey("swing");
   bool isPowerOnlyCommand = doc.containsKey("power") && !hasOtherSettings;
 
   // Log jika power command ada tapi di-skip karena ada settings lain
@@ -666,8 +669,7 @@ void controllHandleCommand(const char* payload, size_t length) {
       powerOn ? "ON" : "OFF"
     );
 
-    send_state(powerOn ? ST_ON : ST_OFF);
-    memcpy(cur, powerOn ? ST_ON : ST_OFF, 16);
+    applyPowerFromLibrary(powerOn);
 
     powerHandled = true;
   }
@@ -676,8 +678,15 @@ void controllHandleCommand(const char* payload, size_t length) {
   // MODE COMMAND
   // =================================================
   if (doc.containsKey("mode")) {
-    String modeStr = String(doc["mode"].as<const char*>());
+    JsonVariant modeValue = doc["mode"];
+    if (!modeValue.is<const char*>()) {
+      Serial.Println("[Controll] Invalid mode type: expected string");
+      return;
+    }
+
+    String modeStr = String(modeValue.as<const char*>());
     modeStr.toUpperCase();
+    modeStr.trim();
 
     Serial.Printf("[Controll] Mode command: %s\n", modeStr.c_str());
 
@@ -731,12 +740,129 @@ void controllHandleCommand(const char* payload, size_t length) {
   bool hasFanCommand = false;
   
   if (doc.containsKey("fan")) {
-    fanStr = String(doc["fan"].as<const char*>());
+    JsonVariant fanValue = doc["fan"];
+    if (!fanValue.is<const char*>()) {
+      Serial.Println("[Controll] Invalid fan type: expected string");
+      return;
+    }
+
+    fanStr = String(fanValue.as<const char*>());
     fanStr.toUpperCase();
     fanStr.trim();
     hasFanCommand = true;
 
     Serial.Printf("[Controll] Fan command: %s\n", fanStr.c_str());
+  }
+
+  // =================================================
+  // SWING COMMAND (Kelvinator: vertical + horizontal)
+  // =================================================
+  bool hasSwingCommand = false;
+
+  if (doc.containsKey("swing")) {
+    JsonVariant swingValue = doc["swing"];
+    hasSwingCommand = true;
+
+    if (doc.containsKey("power")) {
+      ac.setPower(expectedPower);
+    } else {
+      ac.setPower(true);
+    }
+
+    if (swingValue.is<bool>()) {
+      bool swingOn = swingValue.as<bool>();
+      if (swingOn) {
+        ac.setSwingVertical(true, kKelvinatorSwingVAuto);
+        Serial.Printf("[Controll] Swing vertical: AUTO\n");
+      } else {
+        ac.setSwingVertical(false, kKelvinatorSwingVOff);
+        ac.setSwingHorizontal(false);
+        Serial.Printf("[Controll] Swing: OFF (vertical + horizontal)\n");
+      }
+      needSend = true;
+    }
+    else if (swingValue.is<const char*>()) {
+      String swingStr = String(swingValue.as<const char*>());
+      swingStr.toUpperCase();
+      swingStr.trim();
+      Serial.Printf("[Controll] Swing command: %s\n", swingStr.c_str());
+
+      if (swingStr == "AUTO" || swingStr == "ON") {
+        ac.setSwingVertical(true, kKelvinatorSwingVAuto);
+        needSend = true;
+      } else if (swingStr == "OFF") {
+        ac.setSwingVertical(false, kKelvinatorSwingVOff);
+        ac.setSwingHorizontal(false);
+        needSend = true;
+      } else if (swingStr == "HIGHEST") {
+        ac.setSwingVertical(false, kKelvinatorSwingVHighest);
+        needSend = true;
+      } else if (swingStr == "UPPER_MIDDLE") {
+        ac.setSwingVertical(false, kKelvinatorSwingVUpperMiddle);
+        needSend = true;
+      } else if (swingStr == "MIDDLE") {
+        ac.setSwingVertical(false, kKelvinatorSwingVMiddle);
+        needSend = true;
+      } else if (swingStr == "LOWER_MIDDLE") {
+        ac.setSwingVertical(false, kKelvinatorSwingVLowerMiddle);
+        needSend = true;
+      } else if (swingStr == "LOWEST") {
+        ac.setSwingVertical(false, kKelvinatorSwingVLowest);
+        needSend = true;
+      } else {
+        Serial.Printf("[Controll] Invalid swing value: %s\n", swingStr.c_str());
+        hasSwingCommand = false;
+      }
+    }
+    else if (swingValue.is<JsonObject>()) {
+      JsonObject swingObj = swingValue.as<JsonObject>();
+
+      if (swingObj.containsKey("vertical") && swingObj["vertical"].is<const char*>()) {
+        String vStr = String(swingObj["vertical"].as<const char*>());
+        vStr.toUpperCase();
+        vStr.trim();
+
+        if (vStr == "AUTO" || vStr == "ON") {
+          ac.setSwingVertical(true, kKelvinatorSwingVAuto);
+        } else if (vStr == "OFF") {
+          ac.setSwingVertical(false, kKelvinatorSwingVOff);
+        } else if (vStr == "HIGHEST") {
+          ac.setSwingVertical(false, kKelvinatorSwingVHighest);
+        } else if (vStr == "UPPER_MIDDLE") {
+          ac.setSwingVertical(false, kKelvinatorSwingVUpperMiddle);
+        } else if (vStr == "MIDDLE") {
+          ac.setSwingVertical(false, kKelvinatorSwingVMiddle);
+        } else if (vStr == "LOWER_MIDDLE") {
+          ac.setSwingVertical(false, kKelvinatorSwingVLowerMiddle);
+        } else if (vStr == "LOWEST") {
+          ac.setSwingVertical(false, kKelvinatorSwingVLowest);
+        } else {
+          Serial.Printf("[Controll] Invalid swing vertical: %s\n", vStr.c_str());
+        }
+        Serial.Printf("[Controll] Swing vertical: %s\n", vStr.c_str());
+        needSend = true;
+      }
+
+      if (swingObj.containsKey("horizontal")) {
+        bool hOn = false;
+        JsonVariant hVal = swingObj["horizontal"];
+        if (hVal.is<bool>()) {
+          hOn = hVal.as<bool>();
+        } else if (hVal.is<const char*>()) {
+          String hStr = String(hVal.as<const char*>());
+          hStr.toUpperCase();
+          hStr.trim();
+          hOn = (hStr == "ON" || hStr == "TRUE" || hStr == "1");
+        }
+        ac.setSwingHorizontal(hOn);
+        Serial.Printf("[Controll] Swing horizontal: %s\n", hOn ? "ON" : "OFF");
+        needSend = true;
+      }
+    }
+    else {
+      Serial.Println("[Controll] Invalid swing type");
+      hasSwingCommand = false;
+    }
   }
 
   // =================================================

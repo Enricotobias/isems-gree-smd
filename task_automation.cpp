@@ -3,9 +3,10 @@
 #include "automation.h"
 #include "activity.h"
 #include "esp_task_wdt.h"
+#include "runtime_health.h"
 
 void TaskAutomation(void* param) {
-  esp_task_wdt_add(NULL);
+  if (!runtimeRegisterCurrentTask(RUNTIME_AUTO, "AutoTask")) vTaskDelete(NULL);
 
   automationInit();
   activityInit();
@@ -23,9 +24,8 @@ void TaskAutomation(void* param) {
     if (g_cfgMutex && CFG_LOCK() == pdTRUE) {
       automationCheck();
       CFG_UNLOCK();
-    } else {
-      automationCheck();
     }
+    runtimeHeartbeat(RUNTIME_AUTO);
 
     esp_task_wdt_reset();
   }

@@ -5,20 +5,24 @@
 #include "crash_monitor.h"
 #include "automation.h"
 #include "ir_health.h"
+#include "offline_log.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
 #include "ota.h"
 #include "time.h"
 #include "activity.h"
+#include "rtos_common.h"
 
 // ============= MQTT Topics =============
 static String topicStatus;      // isems/devices/{id}/status
 static String topicData;        // isems/devices/{id}/data
 static String topicSetting;     // isems/devices/{id}/setting
+static String topicSettingDayPrefix; // isems/devices/{id}/setting/day/
 
 static String cmdSetting;       // isems/command/{id}/setting
 static String cmdKoneksi;       // isems/command/{id}/koneksi
@@ -42,7 +46,7 @@ static bool pendingSaveRequest = false;
 static unsigned long saveRequestTime = 0;
 extern bool rtcOK;
 
-static BPFrame lastKnownState = {false, false, 0, "", "", 0, "", "", "", ""};
+static BPFrame lastKnownState = {};
 
 
 
@@ -61,6 +65,11 @@ String getDisconnectReasonStr(DisconnectReason reason) {
         case REASON_WDT_RESET: return "WATCHDOG_CRASH";
         case REASON_CRASH:     return "SOFTWARE_CRASH";
         case REASON_MANUAL:    return "MANUAL_SAVE";
+        case REASON_USB_RESET: return "USB_RESET";
+        case REASON_JTAG_RESET: return "JTAG_RESET";
+        case REASON_EFUSE_RESET: return "EFUSE_RESET";
+        case REASON_POWER_GLITCH: return "POWER_GLITCH";
+        case REASON_CPU_LOCKUP: return "CPU_LOCKUP";
         default: return "UNKNOWN";
     }
 }
@@ -71,6 +80,11 @@ static unsigned long lastActionMs = 0;
 // ============= MQTT Client =============
 static WiFiClientSecure espClient;  // Gunakan WiFiClientSecure untuk SSL/TLS
 static PubSubClient mqtt(espClient);
+
+// WiFiClientSecure::connect() menjalankan TCP lalu TLS handshake secara blocking.
+// Tanpa batas ini, packet loss atau captive portal dapat menahan NetTask puluhan
+// detik sebelum mqtt.connect() mengembalikan hasil.
+static const uint16_t MQTT_TLS_HANDSHAKE_TIMEOUT_SEC = 12;
 static String mqttUser = "";
 static String mqttPass = "";
 // Last Will & Testament (LWT) - Dikirim oleh broker jika device disconnect mendadak
@@ -132,6 +146,19 @@ static uint8_t pendingCommandHead = 0;
 static uint8_t pendingCommandTail = 0;
 static uint8_t pendingCommandCount = 0;
 static unsigned long lastDeferredPublishLogMs = 0;
+static bool pendingSettingPublish = false;
+static uint8_t pendingSettingDayMask = 0;
+static unsigned long lastSettingPublishAttemptMs = 0;
+static unsigned long lastSettingDayPublishAttemptMs = 0;
+static const unsigned long SETTING_PUBLISH_RETRY_MS = 1000UL;
+
+static bool immediateWiFiRetryRequested = false;
+static bool wifiCredentialTrialActive = false;
+static bool wifiCredentialRollbackAckPending = false;
+static KoneksiCfg wifiCredentialTrialPrevious;
+static KoneksiCfg wifiCredentialTrialTarget;
+static unsigned long wifiCredentialTrialStartedMs = 0;
+static const unsigned long WIFI_CREDENTIAL_TRIAL_TIMEOUT_MS = 9UL * 60UL * 1000UL;
 
 // ============= Forward Declarations =============
 static void ensureMqttConnected();
@@ -143,6 +170,31 @@ static void handleCmdKoneksi(const char* payload, unsigned int length);
 static void handleCmdSchedule(const char* payload, unsigned int length);
 static void handleCmdRemote(const char* payload, unsigned int length);
 static void serviceNearbyWifiScan();
+static void serviceDeferredRemoteCheck();
+static void serviceOfflineLogFlush();
+static void rollbackWiFiCredentialTrial(const char* reason);
+
+// ============= Helper: Stop SSL client + restore callback =============
+// WAJIB dipakai setiap kali espClient.stop() dipanggil sebelum reconnect.
+// PubSubClient menyimpan pointer callback secara internal — espClient.stop()
+// tidak menghapusnya, tapi mqtt.disconnect() + espClient.stop() dalam urutan
+// tertentu bisa membuat state internal PubSubClient tidak konsisten.
+// Memanggil setCallback() ulang setelah stop adalah cara paling aman.
+static void stopAndResetClient() {
+  if (mqtt.connected()) {
+    mqtt.disconnect();
+  }
+  espClient.stop();
+  // Restore SSL policy
+  if (PROD_ROOT_CA != NULL) {
+    espClient.setCACert(PROD_ROOT_CA);
+  } else {
+    espClient.setInsecure();
+  }
+  espClient.setHandshakeTimeout(MQTT_TLS_HANDSHAKE_TIMEOUT_SEC);
+  // Restore callback — ini yang paling kritis
+  mqtt.setCallback(handleMqttMessage);
+}
 
 // ============= Build Topics =============
 void dataBuildTopics(const String& device_id) {
@@ -150,6 +202,8 @@ void dataBuildTopics(const String& device_id) {
   topicStatus  = "isems/devices/" + device_id + "/status";
   topicData    = "isems/devices/" + device_id + "/data";
   topicSetting = "isems/devices/" + device_id + "/setting";
+  topicSettingDayPrefix = topicSetting + "/day/";
+  pendingSettingDayMask = 0x7F;
   topicInfo = "isems/devices/" + device_id + "/info";
   topicAck = "isems/devices/" + device_id + "/ack";
   activityBuildTopic(device_id);
@@ -185,6 +239,11 @@ String getResetReason() {
     case ESP_RST_TASK_WDT: return "Watchdog (Task)"; // Hang/Looping macet
     case ESP_RST_BROWNOUT: return "Brownout (Low Voltage)"; // Kabel power jelek
     case ESP_RST_SDIO: return "SDIO Reset";
+    case ESP_RST_USB: return "USB Peripheral Reset";
+    case ESP_RST_JTAG: return "JTAG Reset";
+    case ESP_RST_EFUSE: return "eFuse Error Reset";
+    case ESP_RST_PWR_GLITCH: return "Power Glitch Reset";
+    case ESP_RST_CPU_LOCKUP: return "CPU Lockup Reset";
     default: return "Unknown";
   }
 }
@@ -331,11 +390,154 @@ static int32_t measureNetworkPingMs() {
   return ok ? static_cast<int32_t>(elapsed) : -1;
 }
 
+struct RtcBatteryReading {
+  uint16_t raw;
+  uint16_t adcMv;
+  float voltage;
+  int percent;
+};
+
+static int estimateCr1220Percent(float voltage) {
+  if (voltage >= 3.00f) return 100;
+  if (voltage <= 2.00f) return 0;
+
+  // CR1220 has a fairly flat discharge curve; treat this as a health estimate.
+  if (voltage >= 2.85f) {
+    return 80 + (int)((voltage - 2.85f) * (20.0f / 0.15f) + 0.5f);
+  }
+  if (voltage >= 2.70f) {
+    return 50 + (int)((voltage - 2.70f) * (30.0f / 0.15f) + 0.5f);
+  }
+  if (voltage >= 2.50f) {
+    return 20 + (int)((voltage - 2.50f) * (30.0f / 0.20f) + 0.5f);
+  }
+  return (int)((voltage - 2.00f) * (20.0f / 0.50f) + 0.5f);
+}
+
+static RtcBatteryReading readRtcBattery() {
+  const uint8_t samples = 12;
+  uint32_t rawSum = 0;
+  uint32_t mvSum = 0;
+
+  for (uint8_t i = 0; i < samples; ++i) {
+    rawSum += analogRead(BAT_ADC_PIN);
+    mvSum += analogReadMilliVolts(BAT_ADC_PIN);
+    delayMicroseconds(250);
+  }
+
+  RtcBatteryReading reading;
+  reading.raw = rawSum / samples;
+  reading.adcMv = mvSum / samples;
+  float dividerRatio = (BAT_ADC_R_TOP_OHM + BAT_ADC_R_BOT_OHM) / BAT_ADC_R_BOT_OHM;
+  reading.voltage = (reading.adcMv / 1000.0f) * dividerRatio;
+  reading.percent = constrain(estimateCr1220Percent(reading.voltage), 0, 100);
+  return reading;
+}
+
 // ============= Publish Setting =============
+bool dataPublishSettingDay(uint8_t day) {
+  if (day > 6) return false;
+  const uint8_t dayBit = static_cast<uint8_t>(1U << day);
+
+  if (cfgIsRuntimeDefaultDueLoadFailure()) {
+    pendingSettingDayMask &= static_cast<uint8_t>(~dayBit);
+    Serial.Printf("[Data] Skip setting day %u: runtime default config from load failure\n", day);
+    return false;
+  }
+
+  if (!mqtt.connected() || !dataIsPublishReady() || topicSettingDayPrefix.length() == 0) {
+    pendingSettingDayMask |= dayBit;
+    return false;
+  }
+
+  DaySchedule snapshot = {};
+  bool locked = false;
+  if (g_cfgMutex) {
+    if (CFG_LOCK() != pdTRUE) {
+      pendingSettingDayMask |= dayBit;
+      return false;
+    }
+    locked = true;
+  }
+  snapshot = cfg.setting.daily[day];
+  if (locked) CFG_UNLOCK();
+
+  StaticJsonDocument<3072> doc;
+  doc["day"] = DAY_IDX_TO_NUM(day);
+  if (snapshot.type == DAY_OFFTIME) {
+    doc["type"] = "offtime";
+  } else if (snapshot.type == DAY_FULLTIME) {
+    doc["type"] = "fulltime";
+  } else {
+    doc["type"] = "parttime";
+  }
+
+  JsonArray periods = doc.createNestedArray("data");
+  uint8_t count = snapshot.periodCount;
+  if (count > MAX_PERIODS_PER_DAY) count = MAX_PERIODS_PER_DAY;
+  for (uint8_t index = 0; index < count; ++index) {
+    const TimePeriod& period = snapshot.periods[index];
+    JsonObject item = periods.createNestedObject();
+    item["start"] = period.start;
+    item["end"] = period.end;
+    item["mode"] = period.mode;
+    item["fan"] = period.fan;
+    item["set_temp"] = period.set_temp;
+  }
+
+  if (doc.overflowed()) {
+    pendingSettingDayMask |= dayBit;
+    Serial.Printf("[Data] Setting day %u JSON overflow\n", day);
+    return false;
+  }
+
+  String payload;
+  payload.reserve(1536);
+  serializeJson(doc, payload);
+  const String topic = topicSettingDayPrefix + String(day);
+  lastSettingDayPublishAttemptMs = millis();
+
+  mqtt.loop();
+  yield();
+  esp_task_wdt_reset();
+  const bool published = mqtt.publish(topic.c_str(), payload.c_str(), true);
+  if (published) {
+    pendingSettingDayMask &= static_cast<uint8_t>(~dayBit);
+    consecutivePublishFails = 0;
+    Serial.Printf("[Data] Published setting day %u (%u bytes)\n",
+                  day,
+                  static_cast<unsigned>(payload.length()));
+  } else {
+    pendingSettingDayMask |= dayBit;
+    ++consecutivePublishFails;
+    Serial.Printf("[Data] Failed setting day %u publish (state=%d)\n", day, mqtt.state());
+  }
+  return published;
+}
+
+void dataPublishSettingDays(uint8_t dayMask) {
+  dayMask &= 0x7F;
+  pendingSettingDayMask |= dayMask;
+  if (!mqtt.connected() || !dataIsPublishReady()) return;
+
+  for (uint8_t day = 0; day < 7; ++day) {
+    const uint8_t dayBit = static_cast<uint8_t>(1U << day);
+    if ((dayMask & dayBit) == 0) continue;
+    if (!dataPublishSettingDay(day) && !mqtt.connected()) return;
+  }
+}
+
 void dataPublishSetting() {
+  if (cfgIsRuntimeDefaultDueLoadFailure()) {
+    pendingSettingPublish = false;
+    Serial.Println("[Data] Skip setting publish: runtime default config from load failure");
+    return;
+  }
+
   // Pastikan MQTT connected
   if (!mqtt.connected()) {
     Serial.Println("[Data] MQTT not connected, cannot publish setting");
+    pendingSettingPublish = true;
     return;
   }
 
@@ -346,54 +548,27 @@ void dataPublishSetting() {
       Serial.Printf("[Data] Deferring setting publish until MQTT cooldown passes (%lu ms remaining)\n",
                 MQTT_POST_CONNECT_PUBLISH_COOLDOWN_MS - (now - lastMqttConnectMs));
     }
+    pendingSettingPublish = true;
     return;
   }
   
   // Cek apakah topic sudah di-inisialisasi
   if (topicSetting.length() == 0) {
     Serial.Println("[Data] ERROR: topicSetting not initialized");
+    pendingSettingPublish = true;
     return;
   }
-  StaticJsonDocument<4096> doc;
+  lastSettingPublishAttemptMs = millis();
+
+  // The weekly schedule is published only through retained setting/day/{0..6}
+  // topics. Keeping it out of the base setting payload avoids duplicating up to
+  // 70 periods and prevents consumers from treating a partial update as a
+  // complete weekly replacement.
+  StaticJsonDocument<128> doc;
   doc["automation"] = cfg.setting.automation;
 
-  
-  // ============================================================
-  JsonArray daily = doc.createNestedArray("schedule");
-  for (int i = 0; i < 7; ++i) {
-    JsonObject dayObj = daily.createNestedObject();
-    dayObj["day"] = DAY_IDX_TO_NUM(i);
-    JsonArray data = dayObj.createNestedArray("data");
-    DaySchedule& d = cfg.setting.daily[i];
-    if (d.type == DAY_OFFTIME) {
-      dayObj["type"] = "offtime";
-    } else if (d.type == DAY_FULLTIME) {
-      dayObj["type"] = "fulltime";
-      JsonObject p = data.createNestedObject();
-      p["mode"] = d.periods[0].mode;
-      p["fan"] = d.periods[0].fan;
-      p["set_temp"] = d.periods[0].set_temp;
-      p["min_temp"] = d.periods[0].min_temp;
-      p["max_temp"] = d.periods[0].max_temp;
-    } else {
-      dayObj["type"] = "parttime";
-      uint8_t cnt = d.periodCount;
-      if (cnt > MAX_PERIODS_PER_DAY) cnt = MAX_PERIODS_PER_DAY;
-      for (uint8_t pIdx = 0; pIdx < cnt; pIdx++) {
-        JsonObject p = data.createNestedObject();
-        p["start"] = d.periods[pIdx].start;
-        p["end"] = d.periods[pIdx].end;
-        p["mode"] = d.periods[pIdx].mode;
-        p["fan"] = d.periods[pIdx].fan;
-        p["set_temp"] = d.periods[pIdx].set_temp;
-        p["min_temp"] = d.periods[pIdx].min_temp;
-        p["max_temp"] = d.periods[pIdx].max_temp;
-      }
-    }
-  }
-
   String payload;
-  payload.reserve(1500);
+  payload.reserve(128);
   serializeJson(doc, payload);
 
   // Flush pending SSL data sebelum publish
@@ -417,9 +592,11 @@ void dataPublishSetting() {
   
   if (published) {
     consecutivePublishFails = 0;
+    pendingSettingPublish = false;
     Serial.Printf("[Data] ✓ Published setting successfully to: %s\n", topicSetting.c_str());
   } else {
     consecutivePublishFails++;
+    pendingSettingPublish = true;
     Serial.Printf("[Data] ✗ Failed to publish setting to: %s (%d bytes, state=%d, fails=%d)\n", 
               topicSetting.c_str(), payload.length(), mqtt.state(), consecutivePublishFails);
   }
@@ -478,7 +655,7 @@ static bool publishStatusRetainedPayload(const String& payload) {
   return true;
 }
 
-static bool publishDataRetainedPayload(const String& payload) {
+static bool publishDataPayload(const String& payload, bool retained) {
   if (!mqtt.connected()) {
     Serial.Println("[Data] Cannot publish data - MQTT not connected");
     return false;
@@ -491,15 +668,16 @@ static bool publishDataRetainedPayload(const String& payload) {
   const uint8_t* bytes = reinterpret_cast<const uint8_t*>(payload.c_str());
   const size_t payloadLength = payload.length();
 
-  bool ok = mqtt.beginPublish(topicData.c_str(), payloadLength, true);
+  bool ok = mqtt.beginPublish(topicData.c_str(), payloadLength, retained);
   if (ok) {
     size_t written = mqtt.write(bytes, payloadLength);
     ok = (written == payloadLength) && (mqtt.endPublish() == 1);
   }
   if (!ok) {
     consecutivePublishFails++;
-    Serial.Printf("[Data] Failed to publish retained data to: %s (len=%u, fails=%d)\n",
-              topicData.c_str(), static_cast<unsigned>(payloadLength), consecutivePublishFails);
+    Serial.Printf("[Data] Failed to publish %s data to: %s (len=%u, fails=%d)\n",
+                  retained ? "retained" : "non-retained",
+                  topicData.c_str(), static_cast<unsigned>(payloadLength), consecutivePublishFails);
     return false;
   }
 
@@ -507,6 +685,122 @@ static bool publishDataRetainedPayload(const String& payload) {
   mqtt.loop();
   delay(50);
   return true;
+}
+
+static bool publishDataRetainedPayload(const String& payload) {
+  return publishDataPayload(payload, true);
+}
+
+static bool getCurrentEpoch(uint32_t& epoch) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 10) || (timeinfo.tm_year + 1900) <= 2020) {
+    return false;
+  }
+
+  time_t now = time(nullptr);
+  if (now < 1609459200) {
+    return false;
+  }
+
+  epoch = static_cast<uint32_t>(now);
+  return true;
+}
+
+static bool formatEpochDeviceTime(uint32_t epoch, char* out, size_t outLen) {
+  if (out == nullptr || outLen == 0) return false;
+  time_t t = static_cast<time_t>(epoch);
+  struct tm timeinfo;
+  localtime_r(&t, &timeinfo);
+  return strftime(out, outLen, "%Y-%m-%d %H:%M:%S", &timeinfo) > 0;
+}
+
+static void storeOfflineTelemetry(const BPFrame& d, bool read_ok, const char* reason) {
+  if (!read_ok || !d.valid) {
+    Serial.Printf("[OfflineLog] Skip store: invalid sensor frame (%s)\n", reason ? reason : "-");
+    return;
+  }
+
+  uint32_t epoch = 0;
+  if (!getCurrentEpoch(epoch)) {
+    Serial.Println("[OfflineLog] Skip store: device time not valid");
+    return;
+  }
+
+  bool ok = offlineLogAppend(epoch, d.power, static_cast<int16_t>(d.current_temp));
+  if (ok) {
+    Serial.Printf("[OfflineLog] Stored telemetry (%s), count=%lu/%lu file=%u fs_free=%u fs_used=%u/%u\n",
+                  reason ? reason : "-",
+                  static_cast<unsigned long>(offlineLogCount()),
+                  static_cast<unsigned long>(offlineLogCapacity()),
+                  static_cast<unsigned>(offlineLogFileBytes()),
+                  static_cast<unsigned>(offlineLogFsFreeBytes()),
+                  static_cast<unsigned>(offlineLogFsUsedBytes()),
+                  static_cast<unsigned>(offlineLogFsTotalBytes()));
+  } else {
+    Serial.Printf("[OfflineLog] Failed to store telemetry (%s)\n", reason ? reason : "-");
+  }
+}
+
+static bool buildOfflinePayload(const OfflineLogRecord& record, String& payload) {
+  char timeStr[32];
+  if (!formatEpochDeviceTime(record.epoch, timeStr, sizeof(timeStr))) {
+    return false;
+  }
+
+  StaticJsonDocument<256> doc;
+  doc["mac"] = WiFi.macAddress();
+  doc["offline"] = true;
+  doc["device_time"] = timeStr;
+  doc["power"] = record.power != 0;
+  doc["room_temp"] = static_cast<int>(record.room_temp);
+
+  payload = "";
+  serializeJson(doc, payload);
+  return !payload.isEmpty();
+}
+
+static void serviceOfflineLogFlush() {
+  static unsigned long lastFlushMs = 0;
+  static const unsigned long FLUSH_INTERVAL_MS = 3000UL;
+
+  if (!mqtt.connected() || topicData.length() == 0 || !dataIsPublishReady()) return;
+  if (offlineLogCount() == 0) return;
+
+  unsigned long now = millis();
+  if (now - lastFlushMs < FLUSH_INTERVAL_MS) return;
+  lastFlushMs = now;
+
+  OfflineLogRecord record = {};
+  if (!offlineLogPeek(record)) {
+    Serial.Println("[OfflineLog] Dropping unreadable/corrupt record");
+    offlineLogPop();
+    return;
+  }
+
+  String payload;
+  payload.reserve(160);
+  if (!buildOfflinePayload(record, payload)) {
+    Serial.Println("[OfflineLog] Dropping record with invalid timestamp");
+    offlineLogPop();
+    return;
+  }
+
+  if (publishDataPayload(payload, false)) {
+    offlineLogPop();
+    Serial.Printf("[OfflineLog] Flushed 1 record, remaining=%lu file=%u fs_free=%u fs_used=%u/%u\n",
+                  static_cast<unsigned long>(offlineLogCount()),
+                  static_cast<unsigned>(offlineLogFileBytes()),
+                  static_cast<unsigned>(offlineLogFsFreeBytes()),
+                  static_cast<unsigned>(offlineLogFsUsedBytes()),
+                  static_cast<unsigned>(offlineLogFsTotalBytes()));
+  } else {
+    Serial.Printf("[OfflineLog] Flush publish failed (state=%d), remaining=%lu file=%u fs_free=%u fs_used=%u/%u\n",
+                  mqtt.state(), static_cast<unsigned long>(offlineLogCount()),
+                  static_cast<unsigned>(offlineLogFileBytes()),
+                  static_cast<unsigned>(offlineLogFsFreeBytes()),
+                  static_cast<unsigned>(offlineLogFsUsedBytes()),
+                  static_cast<unsigned>(offlineLogFsTotalBytes()));
+  }
 }
 
 // Fungsi helper untuk publish status
@@ -701,8 +995,8 @@ static void ensureMqttConnected() {
   lastMqttRetryMs = now;
   mqttRetryAttempt++;
   
-  // Reset SSL client
-  espClient.stop();
+  // Reset SSL client + restore callback
+  stopAndResetClient();
   delay(100);
   yield();
   
@@ -723,9 +1017,10 @@ static void ensureMqttConnected() {
   buildLwtPayload();
   if (mqttUser.length()) {
     ok = mqtt.connect(clientId, mqttUser.c_str(), mqttPass.c_str(),
-                      topicStatus.c_str(), 1, true, lwtPayload.c_str());
+                      topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
   } else {
-    ok = mqtt.connect(clientId, topicStatus.c_str(), 1, true, lwtPayload.c_str());
+    ok = mqtt.connect(clientId, nullptr, nullptr,
+                      topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
   }
   
   unsigned long connectDuration = millis() - connectStart;
@@ -778,9 +1073,9 @@ static void ensureMqttConnected() {
     yield();
     
     // Subscribe to all command topics (log failures so it isn't silent)
-    if (!mqtt.subscribe(cmdSetting.c_str()))     Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdSetting.c_str());
+    if (!mqtt.subscribe(cmdSetting.c_str(), 1))  Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdSetting.c_str());
     if (!mqtt.subscribe(cmdKoneksi.c_str()))     Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdKoneksi.c_str());
-    if (!mqtt.subscribe(cmdSchedule.c_str()))    Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdSchedule.c_str());
+    if (!mqtt.subscribe(cmdSchedule.c_str(), 1)) Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdSchedule.c_str());
     if (!mqtt.subscribe(cmdRemote.c_str()))      Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", cmdRemote.c_str());
     if (topicCmdUpdate.length() > 0) {
       if (!mqtt.subscribe(topicCmdUpdate.c_str())) Serial.Printf("[MQTT] ✗ Subscribe failed: %s\n", topicCmdUpdate.c_str());
@@ -830,21 +1125,21 @@ static void ensureMqttConnected() {
     if (mqttRetryAttempt >= 3 && !offlineNotifyDone && WiFi.status() == WL_CONNECTED) {
       Serial.Println("[MQTT] 3 retry gagal - mencoba publish status offline...");
       lastDisconnectReason = REASON_MQTT_LOST;
-      espClient.stop();
+      stopAndResetClient();
       yield();
       bool notifyOk;
       buildLwtPayload();
       if (mqttUser.length()) {
         notifyOk = mqtt.connect(clientId, mqttUser.c_str(), mqttPass.c_str(),
-                                topicStatus.c_str(), 1, true, lwtPayload.c_str());
+                                topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
       } else {
-        notifyOk = mqtt.connect(clientId, topicStatus.c_str(), 1, true, lwtPayload.c_str());
+        notifyOk = mqtt.connect(clientId, nullptr, nullptr,
+                                topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
       }
       if (notifyOk) {
         publishStatus("offline");
         delay(100);
-        mqtt.disconnect();
-        espClient.stop();
+        stopAndResetClient();
         Serial.Println("[MQTT] ✓ Status offline berhasil dipublish setelah 3 retry gagal");
       } else {
         Serial.Println("[MQTT] ✗ Offline notify gagal - broker tidak terjangkau, LWT akan aktif");
@@ -858,6 +1153,12 @@ static void ensureMqttConnected() {
 // FUNGSI INIT DATA (SECURE MQTT)
 // ==========================================
 void dataInit() {
+  pinMode(BAT_ADC_PIN, INPUT);
+  analogReadResolution(12);
+  #if defined(ADC_11db)
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+  #endif
+
   // 1. Sync Waktu dulu (CRITICAL STEP)
   // Tanpa ini, setCACert akan menolak koneksi karena "Certificate Not Yet Valid"
   syncTime();
@@ -872,11 +1173,12 @@ void dataInit() {
       Serial.Println("[Data] WARNING: Root CA is NULL! Fallback to Insecure.");
       espClient.setInsecure();
   }
+  espClient.setHandshakeTimeout(MQTT_TLS_HANDSHAKE_TIMEOUT_SEC);
   
   // 3. Konfigurasi MQTT Client
-  mqtt.setBufferSize(2048);    // Buffer cukup untuk payload JSON, hemat heap untuk SSL
+  mqtt.setBufferSize(8192);    // Full retained setting can include many schedule periods
   mqtt.setKeepAlive(30);       // 30 detik keepalive
-  mqtt.setSocketTimeout(15);   // 15 detik timeout socket
+  mqtt.setSocketTimeout(15);   // 15 detik timeout MQTT socket
   mqtt.setCallback(handleMqttMessage);
   
   // Reset flags
@@ -895,15 +1197,30 @@ void dataInit() {
   } else if (r == ESP_RST_BROWNOUT) {
       lastDisconnectReason = REASON_POWER_LOSS;
       Serial.Println("[Data] Disconnect reason: POWER LOSS (brownout detected)");
+  } else if (r == ESP_RST_PWR_GLITCH) {
+      lastDisconnectReason = REASON_POWER_GLITCH;
+      Serial.Println("[Data] Disconnect reason: POWER GLITCH RESET");
   } else if (r == ESP_RST_PANIC) {
       lastDisconnectReason = REASON_CRASH;
       Serial.Println("[Data] Disconnect reason: SOFTWARE CRASH (panic)");
+  } else if (r == ESP_RST_CPU_LOCKUP) {
+      lastDisconnectReason = REASON_CPU_LOCKUP;
+      Serial.Println("[Data] Disconnect reason: CPU LOCKUP / DOUBLE EXCEPTION");
   } else if (r == ESP_RST_POWERON) {
       lastDisconnectReason = REASON_POWER_ON;
       Serial.Println("[Data] Disconnect reason: POWER ON / POWER CYCLE");
   } else if (r == ESP_RST_SW) {
       lastDisconnectReason = REASON_POWER_ON;
       Serial.Println("[Data] Disconnect reason: SOFTWARE RESET (OTA/command)");
+  } else if (r == ESP_RST_USB) {
+      lastDisconnectReason = REASON_USB_RESET;
+      Serial.Println("[Data] Disconnect reason: USB PERIPHERAL RESET");
+  } else if (r == ESP_RST_JTAG) {
+      lastDisconnectReason = REASON_JTAG_RESET;
+      Serial.Println("[Data] Disconnect reason: JTAG RESET");
+  } else if (r == ESP_RST_EFUSE) {
+      lastDisconnectReason = REASON_EFUSE_RESET;
+      Serial.Println("[Data] Disconnect reason: EFUSE ERROR RESET");
   } else {
       lastDisconnectReason = REASON_POWER_ON;
       Serial.Printf("[Data] Disconnect reason: UNKNOWN (esp_reset_reason=%d)\n", (int)r);
@@ -930,6 +1247,7 @@ void dataInit() {
 
   extern void activityBuildTopic(const String&);
   activityBuildTopic(cfg.device_id);
+  offlineLogInit();
   
   esp_task_wdt_reset();
   yield();
@@ -967,11 +1285,16 @@ void dataLoop() {
       wasMqttConnected = false;
     }
     ensureMqttConnected();
+    if (wifiCredentialTrialActive &&
+        millis() - wifiCredentialTrialStartedMs >= WIFI_CREDENTIAL_TRIAL_TIMEOUT_MS) {
+      rollbackWiFiCredentialTrial("MQTT did not connect within validation window");
+    }
     return;
   }
   
   wasMqttConnected = true;
   mqtt.loop();
+  dataOnNetworkConnected();
 
   if (!mqttInitialized && dataIsPublishReady()) {
     yield();
@@ -982,15 +1305,35 @@ void dataLoop() {
     }
   }
 
+  if (pendingSettingPublish && dataIsPublishReady() &&
+      (millis() - lastSettingPublishAttemptMs >= SETTING_PUBLISH_RETRY_MS)) {
+    Serial.Println("[Data] Retrying pending setting publish...");
+    yield();
+    esp_task_wdt_reset();
+    dataPublishSetting();
+  }
+
+  if (pendingSettingDayMask != 0 && dataIsPublishReady() &&
+      (millis() - lastSettingDayPublishAttemptMs >= SETTING_PUBLISH_RETRY_MS)) {
+    for (uint8_t day = 0; day < 7; ++day) {
+      const uint8_t dayBit = static_cast<uint8_t>(1U << day);
+      if ((pendingSettingDayMask & dayBit) != 0) {
+        dataPublishSettingDay(day);
+        break;
+      }
+    }
+  }
+
   processQueuedMqttCommand();
+  serviceDeferredRemoteCheck();
+  serviceOfflineLogFlush();
 
   // Zombie connection detection: MQTT reports connected tapi publish terus gagal.
   // Ini terjadi saat SSL layer rusak tapi TCP masih "connected".
   if (consecutivePublishFails >= 3) {
     Serial.Println("[MQTT] \u2717 Zombie connection detected (3+ publish fails) \u2014 forcing clean reconnect");
     consecutivePublishFails = 0;
-    mqtt.disconnect();
-    espClient.stop();
+    stopAndResetClient();
     return;
   }
 
@@ -1055,8 +1398,134 @@ void dataDisconnect() {
   }
 }
 
+void dataPauseMqttForOta() {
+  Serial.Println("[OTA] Pausing MQTT TLS before HTTP(S) transfer...");
+  isManualDisconnect = true;
+  if (mqtt.connected()) {
+    mqtt.loop();
+    delay(100);
+  }
+  stopAndResetClient();
+  mqttInitialized = false;
+  resetMqttRc2RecoveryState();
+  delay(250);
+  esp_task_wdt_reset();
+  Serial.Printf("[OTA] MQTT TLS released, heap=%u largest=%u\n",
+                ESP.getFreeHeap(),
+                static_cast<unsigned>(
+                    heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+}
+
+void dataResumeMqttAfterOta() {
+  Serial.Println("[OTA] OTA returned without reboot; reconnecting MQTT...");
+  isManualDisconnect = false;
+  mqttRetryAttempt = 0;
+  lastMqttRetryMs = 0;
+  mqttInitialized = false;
+  dataForceConnect();
+}
+
 bool dataIsConnected() {
   return mqtt.connected();
+}
+
+void dataScheduleImmediateWiFiRetry() {
+  immediateWiFiRetryRequested = true;
+}
+
+bool dataConsumeImmediateWiFiRetryRequest() {
+  bool requested = immediateWiFiRetryRequested;
+  immediateWiFiRetryRequested = false;
+  return requested;
+}
+
+bool dataIsWiFiCredentialTrialActive() {
+  return wifiCredentialTrialActive;
+}
+
+bool dataIsWiFiCredentialTrialExpired() {
+  return wifiCredentialTrialActive &&
+         (millis() - wifiCredentialTrialStartedMs >= WIFI_CREDENTIAL_TRIAL_TIMEOUT_MS);
+}
+
+static void rollbackWiFiCredentialTrial(const char* reason) {
+  if (!wifiCredentialTrialActive) return;
+
+  Serial.Printf("[WiFi Guard] Trial failed: %s\n", reason ? reason : "unknown");
+  Serial.Printf("[WiFi Guard] Rolling back to previous SSID: %s\n",
+                wifiCredentialTrialPrevious.wifi_ssid.c_str());
+
+  wifiCredentialTrialActive = false;
+  wifiCredentialRollbackAckPending = true;
+  cfg.koneksi = wifiCredentialTrialPrevious;
+  cfgApply();
+
+  stopAndResetClient();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+  dataScheduleImmediateWiFiRetry();
+}
+
+static void beginWiFiCredentialTrial(const KoneksiCfg& previous, const KoneksiCfg& target) {
+  wifiCredentialTrialPrevious = previous;
+  wifiCredentialTrialTarget = target;
+  wifiCredentialTrialStartedMs = millis();
+  wifiCredentialTrialActive = true;
+  wifiCredentialRollbackAckPending = false;
+
+  cfg.koneksi = target;
+  cfgApply();
+
+  Serial.Printf("[WiFi Guard] Testing new WiFi SSID: %s\n", target.wifi_ssid.c_str());
+  dataPublishAck("koneksi", "processing",
+                 "Testing new WiFi credentials; saving only after WiFi and MQTT connect");
+
+  isManualDisconnect = true;
+  lastDisconnectReason = REASON_MANUAL;
+  lastDisconnectTime = millis();
+  publishStatus("offline");
+  delay(200);
+  stopAndResetClient();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(300);
+  dataScheduleImmediateWiFiRetry();
+}
+
+static void commitWiFiCredentialTrial() {
+  if (!wifiCredentialTrialActive || !mqtt.connected()) return;
+
+  Serial.Printf("[WiFi Guard] WiFi + MQTT validated, committing SSID to NVS: %s\n",
+                wifiCredentialTrialTarget.wifi_ssid.c_str());
+
+  if (!cfgSave()) {
+    rollbackWiFiCredentialTrial("config save failed after MQTT validation");
+    dataPublishAck("koneksi", "failed", "Validation passed but config save failed; rolled back WiFi credentials");
+    return;
+  }
+
+  nvs_setWiFiSSID(wifiCredentialTrialTarget.wifi_ssid);
+  nvs_setWiFiPass(wifiCredentialTrialTarget.wifi_pass);
+  wifiCredentialTrialActive = false;
+  wifiCredentialRollbackAckPending = false;
+
+  dataPublishAck("koneksi", "success", "WiFi credentials validated and saved");
+  dataPublishSetting();
+}
+
+void dataOnWiFiCredentialTrialFailedAfterRetries() {
+  rollbackWiFiCredentialTrial("WiFi failed for 3 retry intervals");
+}
+
+void dataOnNetworkConnected() {
+  if (wifiCredentialTrialActive) {
+    commitWiFiCredentialTrial();
+  } else if (wifiCredentialRollbackAckPending && mqtt.connected()) {
+    wifiCredentialRollbackAckPending = false;
+    dataPublishAck("koneksi", "failed", "New WiFi credentials failed; restored previous WiFi credentials");
+  }
+  otaPendingAckService();
 }
 
 void dataNotifyOffline() {
@@ -1066,22 +1535,22 @@ void dataNotifyOffline() {
   if (topicStatus.length() == 0) return;
   if (mqtt.connected()) return; // Masih connected, tidak perlu notify
   Serial.Println("[MQTT] Mempublish status offline (retry gagal 3x)...");
-  espClient.stop();
+  stopAndResetClient();
   yield();
   bool ok;
   const char* clientId = cfg.device_id.c_str();
   buildLwtPayload();
   if (mqttUser.length()) {
     ok = mqtt.connect(clientId, mqttUser.c_str(), mqttPass.c_str(),
-                      topicStatus.c_str(), 1, true, lwtPayload.c_str());
+                      topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
   } else {
-    ok = mqtt.connect(clientId, topicStatus.c_str(), 1, true, lwtPayload.c_str());
+    ok = mqtt.connect(clientId, nullptr, nullptr,
+                      topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
   }
   if (ok) {
     publishStatus("offline");
     delay(100);
-    mqtt.disconnect();
-    espClient.stop();
+    stopAndResetClient();
     Serial.Println("[MQTT] \u2713 Status offline berhasil dipublish");
   } else {
     Serial.Println("[MQTT] \u2717 Offline notify gagal - broker tidak terjangkau");
@@ -1092,21 +1561,9 @@ void dataResetConnection() {
   // Reset SSL client dan disconnect MQTT untuk memaksa fresh connection
   Serial.Println("[MQTT] Resetting connection (WiFi reconnected)...");
   
-  if (mqtt.connected()) {
-    // Jangan publish "offline" di sini — LWT (broker-side) sudah menangani retained offline status.
-    mqtt.disconnect();
-  }
-  
-  espClient.stop();
+  stopAndResetClient();
   delay(200); // Beri waktu untuk cleanup
   yield();
-  
-  // Reinitialize SSL client - keep CA validation policy consistent with dataInit()
-  if (PROD_ROOT_CA != NULL) {
-    espClient.setCACert(PROD_ROOT_CA);
-  } else {
-    espClient.setInsecure();
-  }
   
   // Reset retry timer agar bisa langsung connect
   lastMqttRetryMs = 0;
@@ -1136,7 +1593,7 @@ void dataForceConnect() {
   }
   
   // Reset SSL client untuk memastikan koneksi bersih
-  espClient.stop();
+  stopAndResetClient();
   delay(100);
   yield();
   
@@ -1156,9 +1613,10 @@ void dataForceConnect() {
   buildLwtPayload();
   if (mqttUser.length()) {
     ok = mqtt.connect(clientId, mqttUser.c_str(), mqttPass.c_str(),
-                      topicStatus.c_str(), 1, true, lwtPayload.c_str());
+                      topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
   } else {
-    ok = mqtt.connect(clientId, topicStatus.c_str(), 1, true, lwtPayload.c_str());
+    ok = mqtt.connect(clientId, nullptr, nullptr,
+                      topicStatus.c_str(), 1, true, lwtPayload.c_str(), false);
   }
   
   unsigned long connectDuration = millis() - connectStart;
@@ -1194,36 +1652,54 @@ void dataForceConnect() {
     lastMqttConnectMs = millis(); // Catat waktu connect untuk cooldown guard
     publishStatus("online");
     
-    // === [MODIFIKASI 2] Kirim Telemetry System Info ===
-    // Kirim data IP, Uptime, dan Error Count ke topik .../info
-    dataPublishInfo(); 
-    // ==================================================
-    
     esp_task_wdt_reset();
     yield();
     
-    // Subscribe to all command topics
-    mqtt.subscribe(cmdSetting.c_str());
-    mqtt.subscribe(cmdKoneksi.c_str());
-    mqtt.subscribe(cmdSchedule.c_str());
-    mqtt.subscribe(cmdRemote.c_str());
-    mqtt.subscribe(cmdReboot.c_str());
+    // Subscribe to all command topics WITH RETRY
+    // Sama dengan ensureMqttConnected() — subscribe gagal → force disconnect → retry bersih
+    int subscribeFailCount = 0;
+    auto trySubscribe = [&](const char* topic, uint8_t qos) -> bool {
+      for (int attempt = 0; attempt < 3; attempt++) {
+        if (mqtt.subscribe(topic, qos)) return true;
+        mqtt.loop();
+        delay(100);
+        esp_task_wdt_reset();
+      }
+      subscribeFailCount++;
+      Serial.Printf("[MQTT] ✗ Subscribe failed after 3 retries: %s\n", topic);
+      return false;
+    };
 
-    mqtt.subscribe(cmdInfo.c_str());
-    
-    // === [MODIFIKASI 3] Wajib Subscribe Topik OTA ===
+    trySubscribe(cmdSetting.c_str(), 1);
+    trySubscribe(cmdKoneksi.c_str(), 0);
+    trySubscribe(cmdSchedule.c_str(), 1);
+    trySubscribe(cmdRemote.c_str(), 0);
+    trySubscribe(cmdReboot.c_str(), 0);
+    trySubscribe(cmdInfo.c_str(), 0);
     if (topicCmdUpdate.length() > 0) {
-       mqtt.subscribe(topicCmdUpdate.c_str());
+      trySubscribe(topicCmdUpdate.c_str(), 0);
     }
-    // ================================================
-    
-    Serial.Println("[MQTT] Subscribed to command topics");
+
+    if (subscribeFailCount > 0) {
+      Serial.Printf("[MQTT] ⚠ %d subscribe(s) gagal — force disconnect untuk reconnect bersih\n", subscribeFailCount);
+      stopAndResetClient();
+      lastMqttRetryMs = 0;
+      return;
+    }
+
+    Serial.Println("[MQTT] ✓ All command topics subscribed successfully");
     
     esp_task_wdt_reset();
     yield();
     
     // Update retry timer setelah berhasil
     lastMqttRetryMs = millis();
+
+    // Publish info + setting setelah cooldown (ditunda ke dataLoop via mqttInitialized flag)
+    // dataPublishInfo() dipindah ke sini tapi dijaga cooldown agar tidak overflow SSL buffer
+    if (dataIsPublishReady()) {
+      dataPublishInfo();
+    }
     
     // Publish setting hanya jika belum pernah di-init
     if (!mqttInitialized) {
@@ -1279,7 +1755,7 @@ static String buildPublishedErrorHex(const BPFrame& frame) {
 // ============= Publish Suhu & Status AC =============
 void dataPublishSuhu(const BPFrame& d, bool read_ok) {
   // Naikkan ukuran buffer JSON karena ada penambahan data string waktu & status
-  StaticJsonDocument<2048> doc;
+  StaticJsonDocument<3072> doc;
   bool setTempValid = sensorIsDisplayHealthy();
   
   // 1. Data Sensor AC
@@ -1297,13 +1773,26 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok) {
   doc["wifi_bssid"] = WiFi.BSSIDstr();
   doc["wifi_rssi"] = WiFi.RSSI();
   doc["net_ping_ms"] = measureNetworkPingMs();
+  RtcBatteryReading rtcBattery = readRtcBattery();
+  doc["rtc_battery_adc"] = rtcBattery.raw;
+  doc["rtc_battery_adc_mv"] = rtcBattery.adcMv;
+  doc["rtc_battery_voltage"] = serialized(String(rtcBattery.voltage, 2));
+  doc["rtc_battery_percent"] = rtcBattery.percent;
   doc["set_temp"] = setTempValid ? (int)sensorGetSetTemp() : 0;
+  bool outdoorEvapValid = sensorHasValidEvapTemp();
+  float outdoorEvapTemp = sensorGetEvapTemp();
   if (read_ok) {
     doc["power"] = d.power;
     doc["mode"] = d.mode;
     doc["fan_speed"] = d.fan;
     doc["room_temp"] = (int)d.current_temp;
+    if (outdoorEvapValid) {
+      doc["evap_temp"] = serialized(String(outdoorEvapTemp, 2));
+    } else {
+      doc["evap_temp"] = nullptr;
+    }
     doc["frame_hex"] = d.frameHex;
+    doc["outdoor_frame_hex"] = sensorGetLastOutdoorFrameHex();
     doc["error_hex"] = buildPublishedErrorHex(d);
     doc["error_code"] = d.errors;
   } else {
@@ -1311,10 +1800,63 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok) {
     doc["mode"] = "-";
     doc["fan_speed"] = "-";
     doc["room_temp"] = 0;
+    if (outdoorEvapValid) {
+      doc["evap_temp"] = serialized(String(outdoorEvapTemp, 2));
+    } else {
+      doc["evap_temp"] = nullptr;
+    }
     doc["frame_hex"] = "";
+    doc["outdoor_frame_hex"] = sensorGetLastOutdoorFrameHex();
     doc["error_hex"] = "0000";
     doc["error_code"] = "-";
   }
+
+  unsigned long mainboardByteCount = sensorGetMainboardByteCount();
+  unsigned long displayByteCount = sensorGetDisplayByteCount();
+  unsigned long mainboardUartAge = sensorTimeSinceLastMainboardByte();
+  unsigned long displayUartAge = sensorTimeSinceLastDisplayByte();
+  unsigned long mainboardFrameAge = sensorTimeSinceLastFrame();
+  unsigned long displayFrameAge = sensorTimeSinceLastDisplayFrame();
+  unsigned long outdoorByteCount = sensorGetOutdoorByteCount();
+  unsigned long outdoorUartAge = sensorTimeSinceLastOutdoorByte();
+  unsigned long outdoorFrameAge = sensorTimeSinceLastOutdoorFrame();
+
+  doc["mainboard_uart_seen"] = mainboardByteCount > 0;
+  doc["mainboard_uart_bytes"] = mainboardByteCount;
+  doc["mainboard_uart_batch_len"] = sensorGetMainboardUartBatchLen();
+  {
+    String sampleHex = sensorGetMainboardUartSampleHex();
+    doc["mainboard_uart_sample_hex"] = sampleHex.length() ? sampleHex : "-";
+  }
+  if (mainboardByteCount > 0) doc["mainboard_uart_age_ms"] = mainboardUartAge;
+  else doc["mainboard_uart_age_ms"] = nullptr;
+  if (sensorHasValidFrame()) doc["mainboard_frame_age_ms"] = mainboardFrameAge;
+  else doc["mainboard_frame_age_ms"] = nullptr;
+
+  doc["display_uart_seen"] = displayByteCount > 0;
+  doc["display_uart_bytes"] = displayByteCount;
+  {
+    String sampleHex = sensorGetDisplayUartSampleHex();
+    doc["display_uart_sample_hex"] = sampleHex.length() ? sampleHex : "-";
+  }
+  if (displayByteCount > 0) doc["display_uart_age_ms"] = displayUartAge;
+  else doc["display_uart_age_ms"] = nullptr;
+  if (sensorHasValidDisplayFrame()) doc["display_frame_age_ms"] = displayFrameAge;
+  else doc["display_frame_age_ms"] = nullptr;
+
+  doc["outdoor_uart_seen"] = outdoorByteCount > 0;
+  doc["outdoor_uart_bytes"] = outdoorByteCount;
+  doc["outdoor_uart_batch_len"] = sensorGetOutdoorUartBatchLen();
+  {
+    String outdoorSampleHex = sensorGetOutdoorUartSampleHex();
+    doc["outdoor_uart_sample_hex"] = outdoorSampleHex.length() ? outdoorSampleHex : "-";
+  }
+  if (outdoorByteCount > 0) doc["outdoor_uart_age_ms"] = outdoorUartAge;
+  else doc["outdoor_uart_age_ms"] = nullptr;
+  if (sensorHasValidEvapTemp()) doc["outdoor_frame_age_ms"] = outdoorFrameAge;
+  else doc["outdoor_frame_age_ms"] = nullptr;
+
+  doc["uart_error_count"] = uartErrorCount;
   
   // 2. Data Koneksi
 
@@ -1339,6 +1881,7 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok) {
 
   if (!mqtt.connected() || topicData.length() == 0) {
     Serial.Println("[Data] Skip publish (MQTT not connected / topicData empty)");
+    storeOfflineTelemetry(d, read_ok, "mqtt disconnected or topic empty");
     return;
   }
 
@@ -1359,6 +1902,7 @@ void dataPublishSuhu(const BPFrame& d, bool read_ok) {
     Serial.Println("[Data] Published suhu + status sistem ke MQTT");
   } else {
     Serial.Printf("[Data] ✗ Publish failed (state=%d)\n", mqtt.state());
+    storeOfflineTelemetry(d, read_ok, "live publish failed");
   }
 }
 
@@ -1464,6 +2008,7 @@ static void handleCmdSetting(const char* payload, unsigned int length) {
       dataPublishSetting();
     } else {
       Serial.Println("[CMD Setting] WARNING: MQTT not connected, cannot publish");
+      pendingSettingPublish = true;
     }
     Serial.Println("[CMD Setting] ========== SUCCESS! ==========");
   } else {
@@ -1481,46 +2026,91 @@ static void handleCmdSetting(const char* payload, unsigned int length) {
 static void handleCmdUpdate(const char* payload, unsigned int length) {
   Serial.Println("[CMD Update] ========== START ==========");
 
-  // 1. Cek Sinyal & Parsing
-  if (WiFi.RSSI() < -85) {
-    dataPublishAck("update", "failed", "Signal weak (< -85dBm)");
-    return;
-  }
-
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError err = deserializeJson(doc, payload, length);
-
   if (err) {
     dataPublishAck("update", "failed", "Invalid JSON");
     return;
   }
 
-  // Bisa menerima "manifest_url" atau "url" (untuk backward compatibility)
-  String url = "";
-  if (doc.containsKey("manifest_url")) {
-      url = doc["manifest_url"].as<String>();
-  } else if (doc.containsKey("url")) {
-      url = doc["url"].as<String>();
+  String action = doc["action"] | "manifest";
+  action.toLowerCase();
+
+  if (action == "rollback") {
+    if (!(doc["confirm"] | false)) {
+      dataPublishAck("update", "failed", "Rollback requires confirm=true");
+      return;
+    }
+
+    dataPublishAck("update", "processing", "Selecting previous OTA firmware...");
+    String rollbackDetail;
+    if (!otaRollbackToPrevious(rollbackDetail)) {
+      dataPublishAck("update", "failed", rollbackDetail);
+      Serial.Println("[CMD Update] ========== END (ROLLBACK FAILED) ==========");
+      return;
+    }
+
+    dataPublishAck("update", "success", rollbackDetail + "; rebooting");
+    mqtt.loop();
+    delay(500);
+    ESP.restart();
+    return;
   }
 
-  if (url.length() > 0) {
-      // 2. Kirim ACK bahwa perintah diterima
-      dataPublishAck("update", "processing", "Request received, starting engine...");
-      
-      // Update status dashboard
-      publishStatus("updating");
-
-      // 3. Panggil proses Manifest (Logika baru)
-      // Fungsi ini sudah mengandung banyak dataPublishAck() didalamnya
-      otaProcessManifest(url);
-
-      // Jika otaProcessManifest selesai tanpa restart (berarti gagal update/versi sama),
-      // kita kembalikan status ke online
-      publishStatus("online");
-
-  } else {
-      dataPublishAck("update", "failed", "URL missing in payload");
+  if (action != "manifest" && action != "direct") {
+    dataPublishAck("update", "failed", "Unknown action; use manifest, direct, or rollback");
+    return;
   }
+  if (WiFi.status() != WL_CONNECTED) {
+    dataPublishAck("update", "failed", "WiFi not connected");
+    return;
+  }
+  if (WiFi.RSSI() < -85) {
+    dataPublishAck("update", "failed", "Signal weak (< -85dBm)");
+    return;
+  }
+
+  String url;
+  String expectedMD5;
+  if (action == "direct") {
+    if (doc.containsKey("binary_url")) url = doc["binary_url"].as<String>();
+    else if (doc.containsKey("download_url")) url = doc["download_url"].as<String>();
+    else if (doc.containsKey("url")) url = doc["url"].as<String>();
+    expectedMD5 = doc["md5"] | "";
+    expectedMD5.toLowerCase();
+
+    bool md5Valid = expectedMD5.length() == 32;
+    for (size_t i = 0; md5Valid && i < expectedMD5.length(); ++i) {
+      const char c = expectedMD5[i];
+      md5Valid = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    }
+    if (!md5Valid) {
+      dataPublishAck("update", "failed", "Direct OTA requires a 32-character hexadecimal md5");
+      return;
+    }
+  } else if (doc.containsKey("manifest_url")) url = doc["manifest_url"].as<String>();
+  else if (doc.containsKey("url")) url = doc["url"].as<String>();
+
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    dataPublishAck("update", "failed", "OTA URL must use HTTP or HTTPS");
+    return;
+  }
+
+  dataPublishAck("update", "processing", "Request received, starting engine...");
+  publishStatus("updating");
+  dataPublishAck("update", "processing", "Pausing MQTT to free TLS heap...");
+  mqtt.loop();
+  delay(150);
+  dataPauseMqttForOta();
+
+  String otaDetail;
+  bool otaOk = action == "direct"
+      ? otaDownloadAndFlash(url, expectedMD5, otaDetail)
+      : otaProcessManifest(url, otaDetail);
+
+  dataResumeMqttAfterOta();
+  publishStatus("online");
+  if (!otaDetail.isEmpty()) dataPublishAck("update", otaOk ? "success" : "failed", otaDetail);
 
   Serial.Println("[CMD Update] ========== END ==========");
 }
@@ -1554,6 +2144,8 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   
   bool wifiChanged = false;
   bool mqttChanged = false;
+  KoneksiCfg previousKoneksi = cfg.koneksi;
+  KoneksiCfg nextKoneksi = cfg.koneksi;
   
   esp_task_wdt_reset();
   yield();
@@ -1563,9 +2155,8 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
     String newSsid = doc["wifi_ssid"].as<String>();
     Serial.Printf("[CMD Koneksi] wifi_ssid: '%s' -> '%s'\n", 
                   cfg.koneksi.wifi_ssid.c_str(), newSsid.c_str());
-    if (newSsid.length() > 0 && newSsid != cfg.koneksi.wifi_ssid) {
-      nvs_setWiFiSSID(newSsid);
-      cfg.koneksi.wifi_ssid = newSsid;
+    if (newSsid.length() > 0 && newSsid != nextKoneksi.wifi_ssid) {
+      nextKoneksi.wifi_ssid = newSsid;
       wifiChanged = true;
     }
   }
@@ -1573,9 +2164,8 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   if (doc.containsKey("wifi_pass")) {
     String newPass = doc["wifi_pass"].as<String>();
     Serial.Println("[CMD Koneksi] wifi_pass: updated");
-    if (newPass.length() > 0 && newPass != cfg.koneksi.wifi_pass) {
-      nvs_setWiFiPass(newPass);
-      cfg.koneksi.wifi_pass = newPass;
+    if (newPass.length() > 0 && newPass != nextKoneksi.wifi_pass) {
+      nextKoneksi.wifi_pass = newPass;
       wifiChanged = true;
     }
   }
@@ -1585,8 +2175,8 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
     String newHost = doc["mqtt_host"].as<String>();
     Serial.Printf("[CMD Koneksi] mqtt_host: '%s' -> '%s'\n", 
                   cfg.koneksi.mqtt_host.c_str(), newHost.c_str());
-    if (newHost.length() > 0 && newHost != cfg.koneksi.mqtt_host) {
-      cfg.koneksi.mqtt_host = newHost;
+    if (newHost.length() > 0 && newHost != nextKoneksi.mqtt_host) {
+      nextKoneksi.mqtt_host = newHost;
       mqttChanged = true;
     }
   }
@@ -1595,8 +2185,8 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
     uint16_t newPort = doc["mqtt_port"].as<uint16_t>();
     Serial.Printf("[CMD Koneksi] mqtt_port: %d -> %d\n", 
                   cfg.koneksi.mqtt_port, newPort);
-    if (newPort > 0 && newPort != cfg.koneksi.mqtt_port) {
-      cfg.koneksi.mqtt_port = newPort;
+    if (newPort > 0 && newPort != nextKoneksi.mqtt_port) {
+      nextKoneksi.mqtt_port = newPort;
       mqttChanged = true;
     }
   }
@@ -1605,8 +2195,8 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
     String newUser = doc["mqtt_user"].as<String>();
     Serial.Printf("[CMD Koneksi] mqtt_user: '%s' -> '%s'\n", 
                   cfg.koneksi.mqtt_user.c_str(), newUser.c_str());
-    if (newUser.length() > 0 && newUser != cfg.koneksi.mqtt_user) {
-      cfg.koneksi.mqtt_user = newUser;
+    if (newUser.length() > 0 && newUser != nextKoneksi.mqtt_user) {
+      nextKoneksi.mqtt_user = newUser;
       mqttChanged = true;
     }
   }
@@ -1614,14 +2204,25 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   if (doc.containsKey("mqtt_pass")) {
     String newPass = doc["mqtt_pass"].as<String>();
     Serial.Println("[CMD Koneksi] mqtt_pass: updated");
-    if (newPass.length() > 0 && newPass != cfg.koneksi.mqtt_pass) {
-      cfg.koneksi.mqtt_pass = newPass;
+    if (newPass.length() > 0 && newPass != nextKoneksi.mqtt_pass) {
+      nextKoneksi.mqtt_pass = newPass;
       mqttChanged = true;
     }
   }
 
+  // Check timezone changes
+  bool tzChanged = false;
+  if (doc.containsKey("tz_offset")) {
+    int8_t newTz = doc["tz_offset"].as<int8_t>();
+    Serial.Printf("[CMD Koneksi] tz_offset: %d -> %d\n", cfg.koneksi.tz_offset, newTz);
+    if (newTz >= -12 && newTz <= 14 && newTz != nextKoneksi.tz_offset) {
+      nextKoneksi.tz_offset = newTz;
+      tzChanged = true;
+    }
+  }
+
   // Check if any changes detected
-  if (!wifiChanged && !mqttChanged) {
+  if (!wifiChanged && !mqttChanged && !tzChanged) {
     Serial.Println("[CMD Koneksi] No changes detected");
     dataPublishAck("koneksi", "success", "No changes detected");
     Serial.Println("[CMD Koneksi] ========== END (No Change) ==========");
@@ -1630,12 +2231,19 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   
   yield();
   esp_task_wdt_reset();
+
+  if (wifiChanged) {
+    Serial.Printf("[CMD Koneksi] WiFi credential trial started for SSID: %s\n",
+                  nextKoneksi.wifi_ssid.c_str());
+    beginWiFiCredentialTrial(previousKoneksi, nextKoneksi);
+    Serial.Println("[CMD Koneksi] ========== WIFI TRIAL ==========");
+    return;
+  }
+
+  cfg.koneksi = nextKoneksi;
   
   // Save configuration
   Serial.Println("[CMD Koneksi] Changes detected, saving config...");
-  if (wifiChanged) {
-    Serial.Printf("[CMD Koneksi] WiFi will change to SSID: %s\n", cfg.koneksi.wifi_ssid.c_str());
-  }
   if (mqttChanged) {
     Serial.Printf("[CMD Koneksi] MQTT will change to: %s:%d\n", 
                   cfg.koneksi.mqtt_host.c_str(), cfg.koneksi.mqtt_port);
@@ -1654,52 +2262,10 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
   Serial.Println("[CMD Koneksi] Config saved successfully to LittleFS");
   yield();
   esp_task_wdt_reset();
-  
-  // === PERBAIKAN UTAMA: TRIGGER IMMEDIATE RECONNECT ===
-  
-  // 1. Set reason untuk monitoring
-  if (wifiChanged) {
-    lastDisconnectReason = REASON_MANUAL;
-    lastDisconnectTime = millis();
-  }
 
-  // 2. Disconnect MQTT dulu (PENTING: Harus graceful!)
-  if (mqtt.connected()) {
-    Serial.Println("[CMD Koneksi] Disconnecting MQTT gracefully...");
-    isManualDisconnect = true; // Flag agar counter tidak bertambah
-    publishStatus("offline");
-    delay(200); // Beri waktu pesan terkirim
-    mqtt.disconnect();
-    espClient.stop();
-  }
-  
-  delay(300);
-  yield();
-  esp_task_wdt_reset();
-  
-  // 3. Apply config ke variabel internal
   cfgApply();
-  
-  // 4. JIKA WIFI BERUBAH: Force disconnect & reconnect
-  if (wifiChanged) {
-    Serial.Println("[CMD Koneksi] WiFi changed, forcing reconnect...");
-    
-    // Kirim ACK sebelum disconnect (ini pesan terakhir!)
-    dataPublishAck("koneksi", "success", "WiFi changed, reconnecting now...");
-    delay(500); // Beri waktu pesan terkirim
-    
-    // Disconnect WiFi total (flag wifiOK di main loop akan trigger reconnect)
-    WiFi.disconnect(true); // true = wipe credentials
-    WiFi.mode(WIFI_OFF);
-    delay(500);
-    
-    // === KUNCI: RESET TIMER AGAR RECONNECT LANGSUNG! ===
-    dataScheduleImmediateWiFiRetry();
-    
-    Serial.Println("[CMD Koneksi] WiFi disconnected, ready for immediate retry");
-  } 
-  // 5. JIKA HANYA MQTT YANG BERUBAH: Reconnect MQTT saja
-  else if (mqttChanged) {
+
+  if (mqttChanged) {
     Serial.Println("[CMD Koneksi] Only MQTT changed, reconnecting broker...");
     
     dataPublishAck("koneksi", "success", "MQTT settings updated, reconnecting...");
@@ -1710,6 +2276,8 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
     lastMqttRetryMs = 0; // Trigger immediate MQTT reconnect
     
     Serial.Println("[CMD Koneksi] MQTT ready for reconnect");
+  } else {
+    dataPublishAck("koneksi", "success", "Connection settings updated");
   }
   
   Serial.Println("[CMD Koneksi] ========== SUCCESS! ==========");
@@ -1718,162 +2286,450 @@ static void handleCmdKoneksi(const char* payload, unsigned int length) {
 // Handler: Update Schedule (jadwal harian)
 static void handleCmdSchedule(const char* payload, unsigned int length) {
   Serial.Println("[CMD Schedule] ========== START ==========");
-  
-  if (length > 2048) {
-    Serial.Println("[CMD Schedule] Payload too large");
+
+  if (!payload || length == 0) {
+    dataPublishAck("schedule", "failed", "Empty payload");
     return;
   }
-  
-  StaticJsonDocument<2048> doc;
-  DeserializationError err = deserializeJson(doc, payload, length);
-  if (err) {
-    Serial.print("[CMD Schedule] JSON parse error: ");
-    dataPublishAck("schedule", "failed", "Invalid JSON format");
-    Serial.Println(err.c_str());
+  if (length > 2048) {
+    dataPublishAck("schedule", "failed", "Payload too large; maximum is 2048 bytes");
     return;
   }
 
-  Serial.Println("[CMD Schedule] JSON parsed OK");
-  bool changed = false;
+  const size_t jsonCapacity = static_cast<size_t>(length) * 2U + 1024U;
+  const size_t largestBlock =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (largestBlock < jsonCapacity) {
+    String detail = "Insufficient parse memory; need=" + String(jsonCapacity) +
+                    " largest=" + String(largestBlock);
+    dataPublishAck("schedule", "failed", detail);
+    return;
+  }
+
+  DynamicJsonDocument doc(jsonCapacity);
+  const DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    dataPublishAck("schedule",
+                   "failed",
+                   err == DeserializationError::NoMemory
+                       ? "JSON document too large"
+                       : "Invalid JSON format");
+    return;
+  }
 
   JsonArray daily = doc.as<JsonArray>();
-  if (daily.isNull()) {
-    dataPublishAck("schedule", "failed", "Payload must be root array");
+  if (daily.isNull() || daily.size() == 0) {
+    dataPublishAck("schedule", "failed", "Payload must be a non-empty root array");
     return;
   }
 
-  auto isValidHHMM = [](const char* s) -> bool {
-    if (!s || strlen(s) != 5 || s[2] != ':') return false;
-    if (!isdigit(s[0]) || !isdigit(s[1]) || !isdigit(s[3]) || !isdigit(s[4])) return false;
-    int h = (s[0] - '0') * 10 + (s[1] - '0');
-    int m = (s[3] - '0') * 10 + (s[4] - '0');
-    return (h >= 0 && h <= 23 && m >= 0 && m <= 59);
-  };
+  static DaySchedule original[7];
+  static DaySchedule staging[7];
+  int defaultSetTemp = 24;
+  int defaultMinTemp = 20;
+  int defaultMaxTemp = 26;
+  char defaultMode[6] = {};
+  char defaultFan[8] = {};
 
-  for (JsonVariant v : daily) {
-    JsonObject dayObj = v.as<JsonObject>();
-    if (dayObj.isNull()) continue;
-
-    if (!dayObj.containsKey("day") || !dayObj["day"].is<int>()) {
-      Serial.Println("[CMD Schedule] SKIP: 'day' must be numeric (0..6)");
-      continue;
-    }
-    int numericDay = dayObj["day"].as<int>();
-    if (numericDay < 0 || numericDay > 6) {
-      Serial.Printf("[CMD Schedule] SKIP: invalid day=%d (valid: 0..6)\n", numericDay);
-      continue;
-    }
-    int idx = DAY_NUM_TO_IDX(numericDay);
-
-    const char* type = dayObj["type"] | "";
-    if (!type || !*type) {
-      Serial.Printf("[CMD Schedule] SKIP: missing type for day=%d\n", numericDay);
-      continue;
-    }
-
-    DaySchedule& d = cfg.setting.daily[idx];
-    memset(d.periods, 0, sizeof(d.periods));
-    d.periodCount = 0;
-
-    if (strcasecmp(type, "offtime") == 0 || strcasecmp(type, "libur") == 0) {
-      d.type = DAY_OFFTIME;
-      changed = true;
-      continue;
-    }
-
-    if (strcasecmp(type, "fulltime") == 0 || strcasecmp(type, "full_time") == 0) {
-      d.type = DAY_FULLTIME;
-      d.periodCount = 1;
-      strncpy(d.periods[0].start, "00:00", sizeof(d.periods[0].start) - 1);
-      strncpy(d.periods[0].end, "23:59", sizeof(d.periods[0].end) - 1);
-      d.periods[0].set_temp = cfg.setting.global_set_temp;
-      d.periods[0].min_temp = cfg.setting.global_min_temp;
-      d.periods[0].max_temp = cfg.setting.global_max_temp;
-      strncpy(d.periods[0].mode, cfg.setting.global_mode.c_str(), sizeof(d.periods[0].mode) - 1);
-      strncpy(d.periods[0].fan, cfg.setting.global_fan.c_str(), sizeof(d.periods[0].fan) - 1);
-      changed = true;
-      continue;
-    }
-
-    if (strcasecmp(type, "parttime") != 0 && strcasecmp(type, "part_time") != 0) {
-      Serial.Printf("[CMD Schedule] SKIP: invalid type='%s' day=%d\n", type, numericDay);
-      continue;
-    }
-
-    JsonArray arr = dayObj["data"].as<JsonArray>();
-    if (arr.isNull() || arr.size() == 0) {
-      Serial.Printf("[CMD Schedule] SKIP: day=%d parttime requires data[]\n", numericDay);
-      continue;
-    }
-
-    d.type = DAY_PARTTIME;
-    uint8_t cnt = 0;
-    for (JsonVariant pv : arr) {
-      if (cnt >= MAX_PERIODS_PER_DAY) break;
-      JsonObject p = pv.as<JsonObject>();
-      if (p.isNull()) continue;
-
-      const char* start = p["start"] | "";
-      const char* end = p["end"] | "";
-      if (!isValidHHMM(start) || !isValidHHMM(end)) continue;
-
-      strncpy(d.periods[cnt].start, start, sizeof(d.periods[cnt].start) - 1);
-      strncpy(d.periods[cnt].end, end, sizeof(d.periods[cnt].end) - 1);
-      d.periods[cnt].set_temp = p["set_temp"] | cfg.setting.global_set_temp;
-      d.periods[cnt].min_temp = p["min_temp"] | cfg.setting.global_min_temp;
-      d.periods[cnt].max_temp = p["max_temp"] | cfg.setting.global_max_temp;
-      const char* mode = p["mode"] | cfg.setting.global_mode.c_str();
-      const char* fan = p["fan"] | cfg.setting.global_fan.c_str();
-      strncpy(d.periods[cnt].mode, mode, sizeof(d.periods[cnt].mode) - 1);
-      strncpy(d.periods[cnt].fan, fan, sizeof(d.periods[cnt].fan) - 1);
-      cnt++;
-    }
-
-    if (cnt == 0) {
-      Serial.Printf("[CMD Schedule] SKIP: day=%d has no valid periods\n", numericDay);
-      d.type = DAY_OFFTIME;
-      continue;
-    }
-
-    d.periodCount = cnt;
-    changed = true;
-    yield();
-  }
-
-  if (changed) {
-    yield();
-    esp_task_wdt_reset();
-    
-    Serial.Println("[CMD Schedule] Saving schedule...");
-    yield();
-    
-    if (!cfgSave()) {
-      Serial.Println("[CMD Schedule] ERROR: Failed to save schedule");
-      dataPublishAck("schedule", "failed", "Storage write error");
-      Serial.Println("[CMD Schedule] ========== FAILED! ==========");
+  bool locked = false;
+  if (g_cfgMutex) {
+    if (CFG_LOCK() != pdTRUE) {
+      dataPublishAck("schedule", "failed", "Configuration busy; retry command");
       return;
     }
-    
-    Serial.Println("[CMD Schedule] Schedule saved successfully");
-    yield();
-    esp_task_wdt_reset();
-    
-    // Apply config changes
-    cfgApply();
-    yield();
-    
-    if (mqtt.connected()) {
-      Serial.Println("[CMD Schedule] Publishing updated setting to MQTT...");
-      dataPublishSetting();
-    } else {
-      Serial.Println("[CMD Schedule] WARNING: MQTT not connected, cannot publish");
+    locked = true;
+  }
+  memcpy(original, cfg.setting.daily, sizeof(original));
+  memcpy(staging, cfg.setting.daily, sizeof(staging));
+  defaultSetTemp = cfg.setting.global_set_temp;
+  defaultMinTemp = cfg.setting.global_min_temp;
+  defaultMaxTemp = cfg.setting.global_max_temp;
+  strncpy(defaultMode, cfg.setting.global_mode.c_str(), sizeof(defaultMode) - 1);
+  strncpy(defaultFan, cfg.setting.global_fan.c_str(), sizeof(defaultFan) - 1);
+  if (locked) CFG_UNLOCK();
+
+  auto copyUpper = [](char* destination, size_t destinationSize, const char* source) {
+    memset(destination, 0, destinationSize);
+    if (!source) return;
+    strncpy(destination, source, destinationSize - 1);
+    for (size_t i = 0; destination[i] != '\0'; ++i) {
+      destination[i] = static_cast<char>(toupper(static_cast<unsigned char>(destination[i])));
     }
-    dataPublishAck("schedule", "success", "Schedule updated");
-    Serial.Println("[CMD Schedule] ========== SUCCESS! ==========");
+  };
+
+  auto normalizeMode = [&](char* destination, const char* source) -> bool {
+    copyUpper(destination, sizeof(((TimePeriod*)nullptr)->mode), source);
+    if (strcmp(destination, "COLD") == 0) {
+      copyUpper(destination, sizeof(((TimePeriod*)nullptr)->mode), "COOL");
+    }
+    return strcmp(destination, "COOL") == 0 || strcmp(destination, "DRY") == 0 ||
+           strcmp(destination, "FAN") == 0 || strcmp(destination, "AUTO") == 0 ||
+           strcmp(destination, "HEAT") == 0;
+  };
+
+  auto normalizeFan = [&](char* destination, const char* source) -> bool {
+    copyUpper(destination, sizeof(((TimePeriod*)nullptr)->fan), source);
+    if (strcmp(destination, "MIN") == 0) {
+      copyUpper(destination, sizeof(((TimePeriod*)nullptr)->fan), "LOW");
+    }
+    if (strcmp(destination, "MED") == 0) {
+      copyUpper(destination, sizeof(((TimePeriod*)nullptr)->fan), "MEDIUM");
+    }
+    if (strcmp(destination, "MAX") == 0) {
+      copyUpper(destination, sizeof(((TimePeriod*)nullptr)->fan), "HIGH");
+    }
+    return strcmp(destination, "LOW") == 0 || strcmp(destination, "MEDIUM") == 0 ||
+           strcmp(destination, "HIGH") == 0 || strcmp(destination, "AUTO") == 0 ||
+           strcmp(destination, "QUIET") == 0 || strcmp(destination, "TURBO") == 0;
+  };
+
+  auto parsePeriod = [&](JsonObject object,
+                         TimePeriod& period,
+                         int day,
+                         int index,
+                         String& failure) -> bool {
+    if (object.isNull()) {
+      failure = "Period must be an object: day=" + String(day) + " index=" + String(index);
+      return false;
+    }
+
+    const char* start = object["start"] | "";
+    const char* end = object["end"] | "";
+    if (scheduleParseMinute(start) < 0 || scheduleParseMinute(end) < 0) {
+      failure = "Invalid HH:MM: day=" + String(day) + " index=" + String(index);
+      return false;
+    }
+
+    int setTemp = defaultSetTemp;
+    if (object.containsKey("set_temp")) {
+      if (!object["set_temp"].is<int>()) {
+        failure = "Invalid set_temp type: day=" + String(day) + " index=" + String(index);
+        return false;
+      }
+      setTemp = object["set_temp"].as<int>();
+    }
+    if (setTemp < 16 || setTemp > 30) {
+      failure = "Invalid set_temp 16..30: day=" + String(day) + " index=" + String(index);
+      return false;
+    }
+
+    memset(&period, 0, sizeof(period));
+    strncpy(period.start, start, sizeof(period.start) - 1);
+    strncpy(period.end, end, sizeof(period.end) - 1);
+    period.set_temp = static_cast<uint8_t>(setTemp);
+    period.min_temp = static_cast<uint8_t>(defaultMinTemp);
+    period.max_temp = static_cast<uint8_t>(defaultMaxTemp);
+
+    const char* mode = object["mode"] | defaultMode;
+    const char* fan = object["fan"] | defaultFan;
+    if (!normalizeMode(period.mode, mode)) {
+      failure = "Invalid mode: day=" + String(day) + " index=" + String(index);
+      return false;
+    }
+    if (!normalizeFan(period.fan, fan)) {
+      failure = "Invalid fan: day=" + String(day) + " index=" + String(index);
+      return false;
+    }
+    return true;
+  };
+
+  auto resultDetail = [&](const ScheduleResult& result) -> String {
+    switch (result.code) {
+      case SCHEDULE_RESULT_INVALID_TIME:
+        return "Invalid schedule time: day=" + String(result.day) +
+               " period=" + String(result.period);
+      case SCHEDULE_RESULT_INVALID_DAY_TYPE:
+        return "Invalid schedule day type: day=" + String(result.day);
+      case SCHEDULE_RESULT_TOO_MANY_PERIODS:
+        return "Too many periods: day=" + String(result.day) +
+               " maximum=" + String(MAX_PERIODS_PER_DAY);
+      case SCHEDULE_RESULT_FULLTIME_CONFLICT:
+        return "Cannot insert into fulltime schedule";
+      case SCHEDULE_RESULT_OVERLAP: {
+        if (result.day >= 0 && result.day <= 6 && result.conflictDay >= 0 &&
+            result.conflictDay <= 6 && result.period >= 0 &&
+            result.period < staging[result.day].periodCount && result.conflictPeriod >= 0 &&
+            result.conflictPeriod < staging[result.conflictDay].periodCount) {
+          const TimePeriod& period = staging[result.day].periods[result.period];
+          const TimePeriod& conflict =
+              staging[result.conflictDay].periods[result.conflictPeriod];
+          return "Schedule overlap: day=" + String(result.day) + " " + period.start + "-" +
+                 period.end + " conflicts with day=" + String(result.conflictDay) + " " +
+                 conflict.start + "-" + conflict.end;
+        }
+        return "Schedule overlap: day=" + String(result.day) +
+               " period=" + String(result.period) +
+               " conflicts_day=" + String(result.conflictDay) +
+               " conflicts_period=" + String(result.conflictPeriod);
+      }
+      default:
+        return "Unknown schedule validation error";
+    }
+  };
+
+  uint8_t seenDayMask = 0;
+  uint8_t affectedDayMask = 0;
+  uint16_t totalInserted = 0;
+  bool hasInsert = false;
+  bool hasReplace = false;
+
+  for (JsonVariant variant : daily) {
+    JsonObject dayObject = variant.as<JsonObject>();
+    if (dayObject.isNull()) {
+      dataPublishAck("schedule", "failed", "Every schedule entry must be an object");
+      return;
+    }
+    if (!dayObject.containsKey("day") || !dayObject["day"].is<int>()) {
+      dataPublishAck("schedule", "failed", "Day must be numeric 0..6");
+      return;
+    }
+
+    const int numericDay = dayObject["day"].as<int>();
+    if (numericDay < 0 || numericDay > 6) {
+      dataPublishAck("schedule", "failed", "Invalid day; expected 0..6");
+      return;
+    }
+    const uint8_t dayBit = static_cast<uint8_t>(1U << numericDay);
+    if ((seenDayMask & dayBit) != 0) {
+      dataPublishAck("schedule", "failed", "Duplicate day in one command: day=" + String(numericDay));
+      return;
+    }
+    seenDayMask |= dayBit;
+
+    const char* operation = dayObject["operation"] | "replace";
+    const bool insertOperation = strcasecmp(operation, "insert") == 0;
+    const bool replaceOperation = strcasecmp(operation, "replace") == 0;
+    if (!insertOperation && !replaceOperation) {
+      dataPublishAck("schedule", "failed", "Invalid operation; expected replace or insert");
+      return;
+    }
+
+    const char* type = dayObject["type"] | "";
+    if (!type || type[0] == '\0') {
+      dataPublishAck("schedule", "failed", "Missing schedule type: day=" + String(numericDay));
+      return;
+    }
+
+    if (insertOperation) {
+      hasInsert = true;
+      if (strcasecmp(type, "parttime") != 0 && strcasecmp(type, "part_time") != 0) {
+        dataPublishAck("schedule", "failed", "Insert requires parttime type");
+        return;
+      }
+
+      JsonArray periodsJson = dayObject["data"].as<JsonArray>();
+      if (periodsJson.isNull() || periodsJson.size() == 0 ||
+          periodsJson.size() > MAX_PERIODS_PER_DAY) {
+        dataPublishAck("schedule",
+                       "failed",
+                       "Insert data must contain 1..10 periods: day=" + String(numericDay));
+        return;
+      }
+
+      TimePeriod incoming[MAX_PERIODS_PER_DAY] = {};
+      uint8_t incomingCount = 0;
+      String failure;
+      for (JsonVariant periodVariant : periodsJson) {
+        if (!parsePeriod(periodVariant.as<JsonObject>(),
+                         incoming[incomingCount],
+                         numericDay,
+                         incomingCount,
+                         failure)) {
+          dataPublishAck("schedule", "failed", failure);
+          return;
+        }
+        ++incomingCount;
+      }
+
+      uint8_t added = 0;
+      ScheduleResult insertResult =
+          scheduleInsertPeriods(staging[numericDay], incoming, incomingCount, &added);
+      if (insertResult.code != SCHEDULE_RESULT_OK) {
+        insertResult.day = numericDay;
+        if (insertResult.conflictDay < 0) insertResult.conflictDay = numericDay;
+        if (insertResult.code == SCHEDULE_RESULT_OVERLAP && insertResult.period >= 0 &&
+            insertResult.period < incomingCount) {
+          const TimePeriod& rejected = incoming[insertResult.period];
+          dataPublishAck("schedule",
+                         "failed",
+                         "Schedule overlap: day=" + String(numericDay) + " " +
+                             rejected.start + "-" + rejected.end +
+                             " conflicts with an existing or inserted period");
+        } else {
+          dataPublishAck("schedule", "failed", resultDetail(insertResult));
+        }
+        return;
+      }
+      totalInserted += added;
+      affectedDayMask |= dayBit;
+      continue;
+    }
+
+    DaySchedule replacement = {};
+    hasReplace = true;
+    if (strcasecmp(type, "offtime") == 0 || strcasecmp(type, "libur") == 0) {
+      replacement.type = DAY_OFFTIME;
+    } else if (strcasecmp(type, "fulltime") == 0 ||
+               strcasecmp(type, "full_time") == 0) {
+      replacement.type = DAY_FULLTIME;
+      replacement.periodCount = 1;
+      strncpy(replacement.periods[0].start, "00:00", sizeof(replacement.periods[0].start) - 1);
+      strncpy(replacement.periods[0].end, "23:59", sizeof(replacement.periods[0].end) - 1);
+      replacement.periods[0].set_temp = static_cast<uint8_t>(defaultSetTemp);
+      replacement.periods[0].min_temp = static_cast<uint8_t>(defaultMinTemp);
+      replacement.periods[0].max_temp = static_cast<uint8_t>(defaultMaxTemp);
+      if (!normalizeMode(replacement.periods[0].mode, defaultMode) ||
+          !normalizeFan(replacement.periods[0].fan, defaultFan)) {
+        dataPublishAck("schedule", "failed", "Invalid global mode or fan for fulltime");
+        return;
+      }
+    } else if (strcasecmp(type, "parttime") == 0 ||
+               strcasecmp(type, "part_time") == 0) {
+      JsonArray periodsJson = dayObject["data"].as<JsonArray>();
+      if (periodsJson.isNull() || periodsJson.size() == 0 ||
+          periodsJson.size() > MAX_PERIODS_PER_DAY) {
+        dataPublishAck("schedule",
+                       "failed",
+                       "Parttime data must contain 1..10 periods: day=" + String(numericDay));
+        return;
+      }
+
+      replacement.type = DAY_PARTTIME;
+      String failure;
+      for (JsonVariant periodVariant : periodsJson) {
+        if (!parsePeriod(periodVariant.as<JsonObject>(),
+                         replacement.periods[replacement.periodCount],
+                         numericDay,
+                         replacement.periodCount,
+                         failure)) {
+          dataPublishAck("schedule", "failed", failure);
+          return;
+        }
+        ++replacement.periodCount;
+      }
+      scheduleSortPeriods(replacement);
+    } else {
+      dataPublishAck("schedule", "failed", "Invalid schedule type: day=" + String(numericDay));
+      return;
+    }
+
+    staging[numericDay] = replacement;
+    affectedDayMask |= dayBit;
+  }
+
+  ScheduleResult validation = scheduleValidateWeek(staging);
+  if (validation.code != SCHEDULE_RESULT_OK) {
+    dataPublishAck("schedule", "failed", resultDetail(validation));
+    return;
+  }
+
+  bool changed = false;
+  for (uint8_t day = 0; day < 7; ++day) {
+    if ((affectedDayMask & (1U << day)) != 0 &&
+        memcmp(&original[day], &staging[day], sizeof(DaySchedule)) != 0) {
+      changed = true;
+      break;
+    }
+  }
+  if (!changed) {
+    const String detail = hasInsert
+                              ? "Insert already applied; no duplicate created"
+                              : "Schedule already matches requested state";
+    dataPublishAck("schedule", "success", detail);
+    return;
+  }
+
+  locked = false;
+  if (g_cfgMutex) {
+    if (CFG_LOCK() != pdTRUE) {
+      dataPublishAck("schedule", "failed", "Configuration busy; retry command");
+      return;
+    }
+    locked = true;
+  }
+
+  memcpy(cfg.setting.daily, staging, sizeof(staging));
+  if (!cfgSaveSchedule()) {
+    memcpy(cfg.setting.daily, original, sizeof(original));
+    if (locked) CFG_UNLOCK();
+    dataPublishAck("schedule", "failed", "Storage write error; previous schedule retained");
+    return;
+  }
+  if (locked) CFG_UNLOCK();
+
+  forceScheduleCheck = true;
+  if (g_taskAutomation) xTaskNotifyGive(g_taskAutomation);
+
+  dataPublishSettingDays(affectedDayMask);
+
+  if (mqtt.connected()) {
+    dataPublishSetting();
   } else {
-    Serial.Println("[CMD Schedule] No valid changes made");
-    Serial.Println("[CMD Schedule] ========== END (No Change) ==========");
-    dataPublishAck("schedule", "success", "No changes made");
+    pendingSettingPublish = true;
+  }
+
+  uint8_t affectedCount = 0;
+  int singleDay = -1;
+  for (uint8_t day = 0; day < 7; ++day) {
+    if ((affectedDayMask & (1U << day)) == 0) continue;
+    ++affectedCount;
+    singleDay = day;
+  }
+
+  String detail;
+  if (affectedCount == 1 && hasInsert && !hasReplace) {
+    detail = "Inserted schedule day=" + String(singleDay) +
+             " added=" + String(totalInserted) +
+             " total=" + String(staging[singleDay].periodCount);
+  } else if (affectedCount == 1 && hasReplace && !hasInsert) {
+    detail = "Replaced schedule day=" + String(singleDay) +
+             " total=" + String(staging[singleDay].periodCount);
+  } else {
+    detail = "Updated schedule days=" + String(affectedCount) +
+             " inserted=" + String(totalInserted);
+  }
+  dataPublishAck("schedule", "success", detail);
+  Serial.Println("[CMD Schedule] ========== SUCCESS ==========");
+}
+
+struct DeferredRemoteCheck {
+  bool pending;
+  unsigned long enqueueMs;
+  BPFrame oldFrame;
+  int oldSetTemp;
+  uint8_t checkCount;
+} g_deferredRemoteCheck = { false, 0, {}, -1, 0 };
+
+static void serviceDeferredRemoteCheck() {
+  if (!g_deferredRemoteCheck.pending) return;
+
+  unsigned long elapsed = millis() - g_deferredRemoteCheck.enqueueMs;
+  if (elapsed < 1500UL) return;
+
+  g_deferredRemoteCheck.checkCount++;
+  bool tracked = false;
+
+  if (g_deferredRemoteCheck.oldSetTemp > 0 && sensorIsDisplayHealthy()) {
+    uint8_t newSetTemp = sensorGetSetTemp();
+    if (newSetTemp > 0 && newSetTemp != g_deferredRemoteCheck.oldSetTemp) {
+      activityTrackTemp(g_deferredRemoteCheck.oldSetTemp, newSetTemp, SOURCE_MQTT_REMOTE);
+      tracked = true;
+    }
+  }
+
+  if (sensorIsHealthy() && g_deferredRemoteCheck.oldFrame.valid) {
+    BPFrame newFrame = sensorGetLastFrame();
+    bool stateChanged = (newFrame.power != g_deferredRemoteCheck.oldFrame.power) ||
+                       (newFrame.mode != g_deferredRemoteCheck.oldFrame.mode) ||
+                       (newFrame.fan != g_deferredRemoteCheck.oldFrame.fan);
+    if (stateChanged) {
+      activityTrackChange(g_deferredRemoteCheck.oldFrame, newFrame, SOURCE_MQTT_REMOTE);
+      tracked = true;
+    }
+  }
+
+  if (tracked || g_deferredRemoteCheck.checkCount >= 3) {
+    g_deferredRemoteCheck.pending = false;
   }
 }
 
@@ -1922,9 +2778,109 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
     Serial.Println("[CMD Remote] ========== REJECTED ==========");
     return;
   }
+
+  auto rejectRemoteValue = [](const char* field, const char* reason) {
+    Serial.Printf("[CMD Remote] REJECT: invalid %s (%s)\n", field, reason);
+    String msg = "Invalid ";
+    msg += field;
+    msg += ": ";
+    msg += reason;
+    dataPublishAck("remote", "failed", msg);
+    Serial.Println("[CMD Remote] ========== REJECTED ==========");
+  };
+
+  auto isValidBoolLike = [](JsonVariant v) -> bool {
+    if (v.is<bool>()) return true;
+    if (v.is<int>()) {
+      int n = v.as<int>();
+      return n == 0 || n == 1;
+    }
+    if (v.is<const char*>()) {
+      String s = v.as<const char*>();
+      s.toUpperCase();
+      s.trim();
+      return s == "ON" || s == "OFF" || s == "TRUE" || s == "FALSE" || s == "1" || s == "0";
+    }
+    return false;
+  };
+
+  auto isValidMode = [](JsonVariant v) -> bool {
+    if (!v.is<const char*>()) return false;
+    String s = v.as<const char*>();
+    s.toUpperCase();
+    s.trim();
+    if (s == "COLD") s = "COOL";
+    return s == "COOL" || s == "DRY" || s == "FAN" || s == "AUTO" || s == "HEAT";
+  };
+
+  auto isValidFan = [](JsonVariant v) -> bool {
+    if (!v.is<const char*>()) return false;
+    String s = v.as<const char*>();
+    s.toUpperCase();
+    s.trim();
+    return s == "LOW" || s == "MIN" || s == "MED" || s == "MEDIUM" ||
+           s == "HIGH" || s == "MAX" || s == "AUTO" || s == "QUIET" || s == "TURBO";
+  };
+
+  if (doc.containsKey("power") && !isValidBoolLike(doc["power"])) {
+    rejectRemoteValue("power", "expected boolean, 0/1, ON/OFF, or TRUE/FALSE");
+    return;
+  }
+
+  if (doc.containsKey("mode") && !isValidMode(doc["mode"])) {
+    rejectRemoteValue("mode", "expected COOL/DRY/FAN/AUTO/HEAT");
+    return;
+  }
+
+  if (doc.containsKey("fan") && !isValidFan(doc["fan"])) {
+    rejectRemoteValue("fan", "expected LOW/MEDIUM/HIGH/AUTO/QUIET/TURBO");
+    return;
+  }
+
+  if (doc.containsKey("temp")) {
+    if (!doc["temp"].is<int>()) {
+      rejectRemoteValue("temp", "expected number 16..30");
+      return;
+    }
+    int t = doc["temp"].as<int>();
+    if (t < 16 || t > 30) {
+      rejectRemoteValue("temp", "expected number 16..30");
+      return;
+    }
+  }
+
+  if (doc.containsKey("swing")) {
+    JsonVariant sv = doc["swing"];
+    if (sv.is<const char*>()) {
+      String s = String(sv.as<const char*>());
+      s.toUpperCase();
+      s.trim();
+      if (s != "AUTO" && s != "ON" && s != "OFF" &&
+          s != "HIGHEST" && s != "UPPER_MIDDLE" && s != "MIDDLE" &&
+          s != "LOWER_MIDDLE" && s != "LOWEST") {
+        rejectRemoteValue("swing", "expected AUTO/ON/OFF/HIGHEST/UPPER_MIDDLE/MIDDLE/LOWER_MIDDLE/LOWEST");
+        return;
+      }
+    } else if (!sv.is<bool>() && !sv.is<JsonObject>()) {
+      rejectRemoteValue("swing", "expected bool, string, or object {vertical, horizontal}");
+      return;
+    }
+  }
   
   esp_task_wdt_reset();
   yield();
+
+  auto readBoolLike = [](JsonVariant v) -> bool {
+    if (v.is<bool>()) return v.as<bool>();
+    if (v.is<int>()) return v.as<int>() != 0;
+    if (v.is<const char*>()) {
+      String s = v.as<const char*>();
+      s.toUpperCase();
+      s.trim();
+      return s == "ON" || s == "TRUE" || s == "1";
+    }
+    return false;
+  };
   
   Serial.Println("[CMD Remote] Sending IR command...");
   
@@ -1943,10 +2899,17 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
   }
 
   // Extract expected state dari command untuk state matching
-  bool expectedPower = doc.containsKey("power") ? doc["power"].as<bool>() : (baselineFrame.valid ? baselineFrame.power : true);
+  bool expectedPower = doc.containsKey("power") ? readBoolLike(doc["power"]) : (baselineFrame.valid ? baselineFrame.power : true);
   String expectedMode = doc.containsKey("mode") ? doc["mode"].as<String>() : (baselineFrame.valid ? baselineFrame.mode : cfg.setting.global_mode);
   String expectedFan = doc.containsKey("fan") ? doc["fan"].as<String>() : (baselineFrame.valid ? baselineFrame.fan : cfg.setting.global_fan);
   uint8_t expectedTemp = doc.containsKey("temp") ? doc["temp"].as<uint8_t>() : cfg.setting.global_set_temp;
+  expectedMode.toUpperCase();
+  expectedFan.toUpperCase();
+  if (doc.containsKey("power") && !expectedPower) {
+    expectedMode = "";
+    expectedFan = "";
+    expectedTemp = 0;
+  }
   
   // Set expected state di automation module
   automationSetExpectedStateFromMqtt(expectedPower, expectedMode, expectedFan, expectedTemp);
@@ -1984,168 +2947,23 @@ static void handleCmdRemote(const char* payload, unsigned int length) {
   if (!doc.containsKey("temp") && oldSetTemp > 0) {
     expectedTemp = (uint8_t)oldSetTemp;
   }
-  
-  // Eksekusi perintah IR + retry jika display tidak merespon
-  // Requirement: bila display/state belum berubah dalam 2 detik, kirim ulang (maks 3x).
-  bool anyActivityTracked = false;
-  static const uint8_t MAX_REMOTE_SEND_ATTEMPTS = 5;
-  static const unsigned long REMOTE_DISPLAY_WAIT_MS = 1000UL;
 
-  // EXPERIMENT: set true to make 1 MQTT command trigger exactly 1 IR send.
-  // Keep the retry logic intact so it can be re-enabled later.
-  static const bool REMOTE_SINGLE_SEND_EXPERIMENT = true;
-
-  const bool wantsPower = doc.containsKey("power");
-  const bool wantsMode  = doc.containsKey("mode");
-  const bool wantsFan   = doc.containsKey("fan");
-  const bool wantsTemp  = doc.containsKey("temp");
-  const bool hasVerifiableKeys = wantsPower || wantsMode || wantsFan || wantsTemp;
-  const uint8_t maxSendAttempts = REMOTE_SINGLE_SEND_EXPERIMENT ? 1 : MAX_REMOTE_SEND_ATTEMPTS;
-
-  if (REMOTE_SINGLE_SEND_EXPERIMENT) {
-    Serial.Println("[CMD Remote] Single-send experiment: retry disabled (1 MQTT = 1 IR send)");
-  }
-
-  auto normalizeModeLabel = [](String v) -> String {
-    v.toUpperCase();
-    v.trim();
-    if (v == "COLD") v = "COOL";
-    return v;
-  };
-
-  auto normalizeFanBucket = [](String v) -> String {
-    v.toUpperCase();
-    v.trim();
-    if (v == "MEDIUM") v = "MED";
-    if (v == "MIN") v = "LOW";
-    if (v == "MAX" || v == "TURBO") v = "HIGH";
-    return v;
-  };
-
-  for (uint8_t sendAttempt = 0; sendAttempt < maxSendAttempts && !anyActivityTracked; ++sendAttempt) {
-    Serial.Printf("[CMD Remote] IR send attempt %u/%u\n", (unsigned)(sendAttempt + 1), (unsigned)maxSendAttempts);
-    controllEnqueueCommand(cmdStr.c_str(), cmdStr.length());
-
-    unsigned long t0 = millis();
-    bool shouldAccept = false;
-    bool shouldTrackTemp = false;
-    bool shouldTrackMainboard = false;
-    int newSetTemp = -1;
-    bool hasFreshSetTemp = false;
-    BPFrame newFrame;
-    bool hasFreshNewFrame = false;
-
-    while ((millis() - t0) < REMOTE_DISPLAY_WAIT_MS) {
-      sensorPoll();
-      delay(50);
-      esp_task_wdt_reset();
-      yield();
-
-      if (sensorIsDisplayHealthy()) {
-        DisplayFrame disp = sensorGetLastDisplayFrame();
-        newSetTemp = (int)disp.set_temp;
-        hasFreshSetTemp = (newSetTemp > 0);
-      }
-
-      newFrame = sensorGetLastFrame();
-      hasFreshNewFrame = (sensorIsHealthy() && newFrame.valid);
-
-      if (hasVerifiableKeys) {
-        bool match = true;
-        if (wantsPower) {
-          if (!hasFreshNewFrame) match = false;
-          else match &= (newFrame.power == expectedPower);
-        }
-        if (wantsMode && expectedPower) {
-          if (!hasFreshNewFrame) match = false;
-          else match &= (normalizeModeLabel(newFrame.mode) == normalizeModeLabel(expectedMode));
-        }
-        if (wantsFan && expectedPower) {
-          if (!hasFreshNewFrame) match = false;
-          else match &= (normalizeFanBucket(newFrame.fan) == normalizeFanBucket(expectedFan));
-        }
-        if (wantsTemp && expectedPower) {
-          if (!hasFreshSetTemp || newSetTemp <= 0) match = false;
-          else match &= ((uint8_t)newSetTemp == expectedTemp);
-        }
-        shouldAccept = match;
-        if (shouldAccept) {
-          shouldTrackTemp = (oldSetTemp > 0 && newSetTemp > 0 && newSetTemp != oldSetTemp);
-          shouldTrackMainboard = hasFreshNewFrame;
-        }
-      } else {
-        bool changed = false;
-        if (oldSetTemp > 0 && newSetTemp > 0 && newSetTemp != oldSetTemp) {
-          changed = true;
-          shouldTrackTemp = true;
-        }
-        if (hasFreshNewFrame) {
-          bool stateChanged = (!oldFrame.valid) ||
-                             (newFrame.power != oldFrame.power) ||
-                             (newFrame.mode != oldFrame.mode) ||
-                             (newFrame.fan != oldFrame.fan);
-          if (stateChanged) {
-            changed = true;
-            shouldTrackMainboard = true;
-          }
-        }
-        shouldAccept = changed;
-      }
-
-      if (shouldAccept) {
-        break; // Early exit: AC has responded!
-      }
-    }
-
-    if (shouldAccept) {
-      if (shouldTrackTemp && oldSetTemp > 0 && newSetTemp > 0) {
-        activityTrackTemp(oldSetTemp, newSetTemp, SOURCE_MQTT_REMOTE);
-        oldSetTemp = newSetTemp;
-      }
-
-      if (shouldTrackMainboard && hasFreshNewFrame) {
-        if (oldFrame.valid) {
-          bool stateChanged = (newFrame.power != oldFrame.power) ||
-                             (newFrame.mode != oldFrame.mode) ||
-                             (newFrame.fan != oldFrame.fan);
-          if (stateChanged) {
-            activityTrackChange(oldFrame, newFrame, SOURCE_MQTT_REMOTE);
-          }
-        } else {
-          activityTrackPower(oldFrame.power, newFrame.power, SOURCE_MQTT_REMOTE);
-          if (newFrame.power) {
-            activityTrackMode(oldFrame.mode, newFrame.mode, SOURCE_MQTT_REMOTE);
-            activityTrackFan(oldFrame.fan, newFrame.fan, SOURCE_MQTT_REMOTE);
-          }
-        }
-        oldFrame = newFrame;
-      }
-
-      anyActivityTracked = true;
-    }
-
-    if (!anyActivityTracked && (sendAttempt + 1) < maxSendAttempts) {
-      Serial.Printf("[CMD Remote] No matching display response within %lu ms, retrying...\n", (unsigned long)REMOTE_DISPLAY_WAIT_MS);
-    }
-  }
-  
-  if (!anyActivityTracked) {
-    Serial.Println("[CMD Remote] AC did not respond - activity not tracked");
-    dataPublishAck("remote", "no_response", "No fresh state change detected after command");
-    Serial.Println("[CMD Remote] ========== NO RESPONSE ==========");
+  // Enqueue IR command (non-blocking; TaskControl handles transmission).
+  bool enqueued = controllEnqueueCommand(cmdStr.c_str(), cmdStr.length());
+  if (!enqueued) {
+    Serial.println("[CMD Remote] IR enqueue failed");
+    automationClearExpectedStateFromMqtt();
+    dataPublishAck("remote", "failed", "IR queue full or unavailable");
     return;
   }
-  
-  esp_task_wdt_reset();
-  yield();
-  
-  // ═══════════════════════════════════════════════════════════════════
-  // MQTT remote tidak trigger manual recovery.
-  // Manual recovery hanya dari data AC (monitorExternalChange).
-  // ═══════════════════════════════════════════════════════════════════
-  
-  dataPublishAck("remote", "success", "Command executed");
-  Serial.Println("[CMD Remote] ========== SUCCESS! ==========");
+
+  g_deferredRemoteCheck.pending = true;
+  g_deferredRemoteCheck.enqueueMs = millis();
+  g_deferredRemoteCheck.oldFrame = oldFrame;
+  g_deferredRemoteCheck.oldSetTemp = oldSetTemp;
+  g_deferredRemoteCheck.checkCount = 0;
+
+  // Response validation ACK is handled by ir_health.
 }
 
 // ============= MQTT Message Router =============
@@ -2288,9 +3106,8 @@ void dataCheckPendingSave() {
     // Best-effort: publish retained offline before graceful disconnect.
     publishStatus("offline");
     delay(200);
-    mqtt.disconnect();
+    stopAndResetClient();
     delay(100);
-    espClient.stop();  // Tutup SSL socket agar tidak leak FD
   }
 
   // --- BAGIAN INI DIHAPUS/DISEDERHANAKAN ---

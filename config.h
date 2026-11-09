@@ -3,8 +3,9 @@
 #include <RTClib.h>
 #include <Wire.h>
 #include <Preferences.h>
+#include "schedule_logic.h"
 
-// Compatibility shim: some files still use Serial.Println/Printf (capital P),
+// Compatibility shim: some files still use Serial.Println/Printf (capital P), 
 // but HWCDC/Arduino uses println/printf.
 #ifndef ISEMS_SERIAL_CASE_COMPAT
 #define ISEMS_SERIAL_CASE_COMPAT
@@ -19,7 +20,13 @@
 #define RTC_SDA_PIN 5
 #define RTC_SCL_PIN 6
 
-#define FW_VERSION "1.6.7"
+// ========= CR1220 RTC Backup Battery Monitor =========
+// BAT_ADC = divider VBAT_CR1220 -> GPIO4 / ADC1_CH4
+#define BAT_ADC_PIN 4
+#define BAT_ADC_R_TOP_OHM 10000000.0f
+#define BAT_ADC_R_BOT_OHM 4700000.0f
+
+#define FW_VERSION "2.5.0"
 // Merk AC disimpan sebagai konstanta agar ikut tertanam di .bin
 #define AC_BRAND "GREE"
 
@@ -29,35 +36,7 @@ extern RTC_PCF8563 rtc;
 extern const char* PROD_ROOT_CA;
 
 
-enum DayType : uint8_t {
-  DAY_OFFTIME  = 0,
-  DAY_FULLTIME = 1,
-  DAY_PARTTIME = 2
-};
-
-#define DAY_FULL DAY_FULLTIME
-#define DAY_PART_TIME DAY_PARTTIME
-#define DAY_LIBUR DAY_OFFTIME
-
-static const uint8_t MAX_PERIODS_PER_DAY = 5;
-
-struct TimePeriod {
-  char start[6];
-  char end[6];
-  char mode[6];
-  char fan[8];
-  uint8_t set_temp;
-  uint8_t min_temp;
-  uint8_t max_temp;
-};
-
-struct DaySchedule {
-  DayType type;
-  uint8_t periodCount;
-  TimePeriod periods[MAX_PERIODS_PER_DAY];
-};
-
-// Day numbering standard: Senin=0, Selasa=1, ..., Minggu=6
+// Day numbering standard: Minggu=0, Senin=1, ..., Sabtu=6
 #define DAY_NUM_TO_IDX(n) ((int)(n))
 #define DAY_IDX_TO_NUM(i) ((int)(i))
 
@@ -68,6 +47,7 @@ struct KoneksiCfg {
   uint16_t mqtt_port;
   String mqtt_user;
   String mqtt_pass;
+  int8_t tz_offset;  // Timezone offset dari UTC (jam). WIB=7, WITA=8, WIT=9
 };
 
 struct SettingCfg {
@@ -98,6 +78,8 @@ struct Config {
 
 extern Config cfg;
 
+String getStableDeviceMac();
+
 String nvs_getWiFiSSID();
 String nvs_getWiFiPass();
 void   nvs_setWiFiSSID(const String& ssid);
@@ -105,6 +87,9 @@ void   nvs_setWiFiPass(const String& pass);
 
 bool cfgLoad();
 bool cfgSave();
+bool cfgSaveSchedule();
+bool cfgIsRuntimeDefaultDueLoadFailure();
+void cfgStartDeferredDefaultSave();
 void cfgApply(); // Apply MQTT config only (tanpa disconnect WiFi)
 void cfgApplyWiFi(); // Apply WiFi config (disconnect & reconnect WiFi)
 void cfgStartWiFiConnect(); // Non-blocking WiFi connection start

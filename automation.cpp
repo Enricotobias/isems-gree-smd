@@ -1,4 +1,4 @@
-#include "automation.h"
+﻿#include "automation.h"
 #include "config.h"
 #include "controll.h"
 #include "crash_monitor.h"
@@ -10,8 +10,6 @@
 
 #include "activity.h"
 #include <WiFi.h>
-
-static bool lastAutomationState = false;
 
 static String normalizeFanSpeed(const String& fan) {
   String normalized = fan;
@@ -25,8 +23,6 @@ static String normalizeFanSpeed(const String& fan) {
   return normalized;
 }
 
-static unsigned long lastRecoveryCheckMs = 0;
-const unsigned long RECOVERY_CHECK_INTERVAL_MS = 5000UL;
 static unsigned long lastScheduleCheckMs = 0;
 const unsigned long SCHEDULE_CHECK_INTERVAL_MS = 10000UL;
 
@@ -46,7 +42,7 @@ static const unsigned long IR_VERIFY_TIMEOUT_MS = 25000UL;
 // Global throttle untuk mencegah spam IR command (jadwal/resync/mode-sync).
 // Aman: sedikit di atas IR settle time agar display/state sempat update.
 
-// Counter untuk tracking cooling attempts
+// Legacy counters retained for binary/config compatibility; temperature maintenance is disabled.
 static int coolingAttemptCount = 0;
 
 static bool expectedPowerValid = false;
@@ -63,13 +59,11 @@ volatile bool forceScheduleCheck = false;
 
 static unsigned long lastSystemActionMs = 0;
 static const unsigned long SYSTEM_ACTION_WINDOW_MS = 15000;
-static bool isSystemAction = false;
 static bool firstRunMonitor = true;
-static bool systemActionFromAutomation = false;
-static bool systemActionFromMqtt = false;
 
 static bool lastLoggedShouldBeOn = false;
 static bool logStateInit = false;
+static bool lastDryModeWindowActive = false;
 
 static bool lastKnownPower = false;
 static uint8_t lastKnownSetTemp = 0;
@@ -93,6 +87,10 @@ static String lastKnownBpFan = "";
 
 static bool lastSchedulePower = false;
 static bool scheduleStateInit = false;
+static bool lastScheduleTargetValid = false;
+static char lastScheduleTargetMode[6] = {};
+static char lastScheduleTargetFan[8] = {};
+static int lastScheduleTargetTemp = -1;
 
 enum ActionSource {
   ACTION_NONE,
@@ -190,26 +188,27 @@ static bool matchesExpectedState(const DisplayFrame& disp) {
   return true;
 }
 
-static bool isRecentSystemAction() {
-  return (lastActionSource != ACTION_NONE) &&
-         (millis() - lastActionMs < 1500);
-}
-
 static bool getACPowerStatus() {
+  // Mainboard reflects the actual indoor-unit power state. Prefer it so an
+  // ambiguous display frame cannot make automation resend a redundant OFF IR command.
+  BPFrame frame = sensorGetLastFrame();
+  if (sensorIsHealthy()) {
+    return frame.power;
+  }
+
   if (sensorIsDisplayHealthy()) {
     DisplayFrame disp = sensorGetLastDisplayFrame();
     return disp.power;
   }
-  BPFrame frame = sensorGetLastFrame();
-  return sensorIsHealthy() ? frame.power : false;
+
+  return false;
 }
 
 static int getDayOfWeek() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return -1;
-  int day = timeinfo.tm_wday - 1;
-  if (day < 0) day = 6;
-  return day;
+  // tm_wday is 0 for Sunday, 1 for Monday, etc.
+  return timeinfo.tm_wday;
 }
 
 static void getCurrentHourMinute(int &hour, int &minute) {
@@ -221,60 +220,110 @@ static void getCurrentHourMinute(int &hour, int &minute) {
   minute = timeinfo.tm_min;
 }
 
-static bool parseTime(const String& timeStr, int &hour, int &minute) {
-  if (timeStr.length() != 5 || timeStr.charAt(2) != ':') return false;
-  hour = timeStr.substring(0, 2).toInt();
-  minute = timeStr.substring(3, 5).toInt();
-  return (hour >= 0 && hour < 24 && minute >= 0 && minute < 60);
-}
-
-static bool isWithinOperatingHours(const String& mulai, const String& selesai) {
-  int curH, curM;
-  getCurrentHourMinute(curH, curM);
-  if (curH < 0) return false;
-  
-  int sH, sM, eH, eM;
-  if (!parseTime(mulai, sH, sM)) return false;
-  if (!parseTime(selesai, eH, eM)) return false;
-  
-  int curMin = curH * 60 + curM;
-  int sMin = sH * 60 + sM;
-  int eMin = eH * 60 + eM;
-  
-  if (eMin < sMin) return (curMin >= sMin || curMin <= eMin);
-  return (curMin >= sMin && curMin < eMin);
-}
-
 static const TimePeriod* getActiveTimePeriod() {
   int dayIdx = getDayOfWeek();
   if (dayIdx < 0) return nullptr;
 
-  DaySchedule& d = cfg.setting.daily[dayIdx];
-  if (d.type == DAY_OFFTIME) return nullptr;
-  if (d.type == DAY_FULLTIME) {
-    return (d.periodCount > 0) ? &d.periods[0] : nullptr;
-  }
-
   int curH, curM;
   getCurrentHourMinute(curH, curM);
   if (curH < 0) return nullptr;
-  int curMin = curH * 60 + curM;
+  return scheduleFindActivePeriod(cfg.setting.daily, dayIdx, curH * 60 + curM);
+}
 
-  uint8_t cnt = d.periodCount;
-  if (cnt > MAX_PERIODS_PER_DAY) cnt = MAX_PERIODS_PER_DAY;
-  for (uint8_t p = 0; p < cnt; p++) {
-    if (d.periods[p].start[0] == '\0' || d.periods[p].end[0] == '\0') continue;
-    int sH = ((d.periods[p].start[0] - '0') * 10) + (d.periods[p].start[1] - '0');
-    int sM = ((d.periods[p].start[3] - '0') * 10) + (d.periods[p].start[4] - '0');
-    int eH = ((d.periods[p].end[0] - '0') * 10) + (d.periods[p].end[1] - '0');
-    int eM = ((d.periods[p].end[3] - '0') * 10) + (d.periods[p].end[4] - '0');
-    int sMin = sH * 60 + sM;
-    int eMin = eH * 60 + eM;
-    bool inRange = (eMin < sMin) ? (curMin >= sMin || curMin < eMin) : (curMin >= sMin && curMin < eMin);
-    if (inRange) return &d.periods[p];
+static int parseMinuteOfDay(const char* hhmm) {
+  return scheduleParseMinute(hhmm);
+}
+
+struct MinuteInterval {
+  int start;
+  int end;
+};
+
+static void addInterval(MinuteInterval intervals[], uint8_t& count, int startMin, int endMin) {
+  if (startMin < 0 || endMin < 0 || count >= (MAX_PERIODS_PER_DAY * 2)) return;
+
+  if (endMin < startMin) {
+    intervals[count++] = {startMin, 1440};
+    if (count < (MAX_PERIODS_PER_DAY * 2)) intervals[count++] = {0, endMin + 1};
+  } else {
+    intervals[count++] = {startMin, endMin + 1};
+  }
+}
+
+static bool scheduleCoversFullDay(const DaySchedule& day) {
+  if (day.type == DAY_FULLTIME) return true;
+  if (day.type != DAY_PARTTIME) return false;
+
+  MinuteInterval intervals[MAX_PERIODS_PER_DAY * 2];
+  uint8_t count = 0;
+  uint8_t periodCount = day.periodCount;
+  if (periodCount > MAX_PERIODS_PER_DAY) periodCount = MAX_PERIODS_PER_DAY;
+
+  for (uint8_t i = 0; i < periodCount; i++) {
+    int startMin = parseMinuteOfDay(day.periods[i].start);
+    int endMin = parseMinuteOfDay(day.periods[i].end);
+    addInterval(intervals, count, startMin, endMin);
+  }
+  if (count == 0) return false;
+
+  for (uint8_t i = 1; i < count; i++) {
+    MinuteInterval key = intervals[i];
+    int j = i - 1;
+    while (j >= 0 && intervals[j].start > key.start) {
+      intervals[j + 1] = intervals[j];
+      j--;
+    }
+    intervals[j + 1] = key;
   }
 
-  return nullptr;
+  const int maxGapMin = 1;
+  if (intervals[0].start > maxGapMin) return false;
+
+  int coveredUntil = intervals[0].end;
+  for (uint8_t i = 1; i < count; i++) {
+    if (intervals[i].start > coveredUntil + maxGapMin) return false;
+    if (intervals[i].end > coveredUntil) coveredUntil = intervals[i].end;
+  }
+
+  return coveredUntil >= (1440 - maxGapMin);
+}
+
+static int firstPeriodStartMinute(const DaySchedule& day) {
+  int firstStart = -1;
+  uint8_t periodCount = day.periodCount;
+  if (periodCount > MAX_PERIODS_PER_DAY) periodCount = MAX_PERIODS_PER_DAY;
+
+  for (uint8_t i = 0; i < periodCount; i++) {
+    int startMin = parseMinuteOfDay(day.periods[i].start);
+    if (startMin >= 0 && (firstStart < 0 || startMin < firstStart)) {
+      firstStart = startMin;
+    }
+  }
+  return firstStart;
+}
+
+static bool isWithinMinuteWindow(int currentMin, int startMin, int durationMin) {
+  if (currentMin < 0 || startMin < 0 || durationMin <= 0) return false;
+  int endMin = startMin + durationMin;
+  if (endMin <= 1440) return currentMin >= startMin && currentMin < endMin;
+  return currentMin >= startMin || currentMin < (endMin - 1440);
+}
+
+static bool isDryModeWindowActive(const TimePeriod* activePeriod) {
+  if (!activePeriod) return false;
+
+  int dayIdx = getDayOfWeek();
+  if (dayIdx < 0) return false;
+
+  DaySchedule& day = cfg.setting.daily[dayIdx];
+  if (day.type == DAY_OFFTIME) return false;
+
+  int hour, minute;
+  getCurrentHourMinute(hour, minute);
+  if (hour < 0) return false;
+
+  int startMin = scheduleCoversFullDay(day) ? (6 * 60) : firstPeriodStartMinute(day);
+  return isWithinMinuteWindow((hour * 60) + minute, startMin, 15);
 }
 
 static inline int resolveSetTemp(const TimePeriod* tp) {
@@ -298,72 +347,38 @@ static inline String resolveMode(const TimePeriod* tp) {
 static inline String resolveFan(const TimePeriod* tp) {
   String fallback = cfg.setting.global_fan;
   if (fallback.length() == 0) fallback = "AUTO";
-  return (tp && tp->fan[0] != '\0') ? String(tp->fan) : fallback;
+  String fan = (tp && tp->fan[0] != '\0') ? String(tp->fan) : fallback;
+  // AUTO tidak bisa divalidasi IR (display tidak mengirimkan nilai AUTO).
+  // Konversi ke LOW di sini agar semua path otomatis aman.
+  String f = fan;
+  f.toUpperCase();
+  f.trim();
+  if (f == "AUTO") return String("LOW");
+  return normalizeFanSpeed(fan);
 }
 
-static String selectOptimalFanSpeed(int currentTemp, int targetTemp) {
-  int tempDiff = currentTemp - targetTemp;
-  
-  Serial.Printf("[Auto] Temperature Analysis: Current=%d, Target=%d, Diff=%d\n", 
-            currentTemp, targetTemp, tempDiff);
-  
-  String fanSpeed;
-  
-  if (tempDiff < -1) {
-    fanSpeed = "LOW";
-    Serial.Printf("[Auto] Temp %d°C below target → Fan: LOW (ultra silent)\n", abs(tempDiff));
-  }
-  else if (tempDiff <= 0) {
-    fanSpeed = "LOW";
-    Serial.Println("[Auto] Temp at/near target → Fan: LOW (energy saving)");
-  }
-  else if (tempDiff == 1) {
-    fanSpeed = "HIGH";
-    Serial.Println("[Auto] Temp 1°C above target → Fan: HIGH (aggressive cooling)");
-  }
-  else {
-    fanSpeed = "TURBO";
-    Serial.Printf("[Auto] Temp %d°C above target → Fan: TURBO (maximum cooling)\n", tempDiff);
-  }
-  
-  return fanSpeed;
+static bool scheduleTargetChanged(const String& mode, const String& fan, int setTemp) {
+  return !lastScheduleTargetValid || strcmp(lastScheduleTargetMode, mode.c_str()) != 0 ||
+         strcmp(lastScheduleTargetFan, fan.c_str()) != 0 ||
+         lastScheduleTargetTemp != setTemp;
 }
 
-static bool isIntelligentFanChange(const String& oldFan, const String& newFan, 
-                                   int currentTemp, int targetTemp) {
-  if (resolveFan(getActiveTimePeriod()) != "AUTO") {
-    return false;
-  }
-  
-  String expectedFan = selectOptimalFanSpeed(currentTemp, targetTemp);
-  
-  // Normalize untuk comparison
-  String normalizedNew = newFan;
-  normalizedNew.toUpperCase();
-  normalizedNew.trim();
-  
-  String normalizedExpected = expectedFan;
-  normalizedExpected.toUpperCase();
-  normalizedExpected.trim();
-  
-  return (normalizedNew == normalizedExpected);
+static void rememberScheduleTarget(const String& mode, const String& fan, int setTemp) {
+  memset(lastScheduleTargetMode, 0, sizeof(lastScheduleTargetMode));
+  memset(lastScheduleTargetFan, 0, sizeof(lastScheduleTargetFan));
+  strncpy(lastScheduleTargetMode, mode.c_str(), sizeof(lastScheduleTargetMode) - 1);
+  strncpy(lastScheduleTargetFan, fan.c_str(), sizeof(lastScheduleTargetFan) - 1);
+  lastScheduleTargetTemp = setTemp;
+  lastScheduleTargetValid = true;
 }
 
-static void trackAndExecute(
-  std::function<void()> executeFunc,
-  const BPFrame& expectedNewState,
-  ActivitySource source = SOURCE_AUTOMATION
-) {
-  BPFrame oldState = sensorGetLastFrame();
-  bool oldStateFresh = sensorIsHealthy();
-  
-  executeFunc();
-  
-  delay(500);
-  
-  if (oldStateFresh) {
-    activityTrackChange(oldState, expectedNewState, source);
-  }
+// sanitizeFan tetap ada sebagai safety net untuk input dari luar resolveFan.
+static inline String sanitizeFan(const String& fan) {
+  String f = fan;
+  f.toUpperCase();
+  f.trim();
+  if (f == "AUTO") return String("LOW");
+  return normalizeFanSpeed(fan);
 }
 
 static void turnACOn() {
@@ -418,35 +433,10 @@ static void turnACOff() {
   controllEnqueueCommand(jsonStr.c_str(), jsonStr.length());
 }
 
-static void applyTempAndMode(int temp, const String& mode) {
-  Serial.Printf("[Auto] Set %d°C, mode=%s\n", temp, mode.c_str());
-
-  if (sensorIsDisplayHealthy()) {
-    DisplayFrame disp = sensorGetLastDisplayFrame();
-    if ((int)disp.set_temp != temp) {
-      activityTrackTemp((int)disp.set_temp, temp, SOURCE_AUTOMATION);
-    }
-  }
-  
-  BPFrame currentFrame = sensorGetLastFrame();
-  if (sensorIsHealthy() && currentFrame.mode != mode) {
-    activityTrackMode(currentFrame.mode, mode, SOURCE_AUTOMATION);
-  }
-
-  lastActionMs = millis();
-  lastActionSource = ACTION_AUTOMATION;
-
-  // Command ini tidak mengirim fan, jadi jangan memvalidasi fan.
-  setExpectedState(true, mode, "", (uint8_t)temp);
-  
-  StaticJsonDocument<256> doc;
-  doc["power"] = true; doc["temp"] = temp; doc["mode"] = mode;
-  String jsonStr; serializeJson(doc, jsonStr);
-  controllEnqueueCommand(jsonStr.c_str(), jsonStr.length());
-}
-
 static void applyTempModeFan(int temp, const String& mode, const String& fan) {
-  Serial.Printf("[Auto] Set %d°C, mode=%s, fan=%s\n", temp, mode.c_str(), fan.c_str());
+  // AUTO tidak dikenali oleh display frame â€” konversi ke LOW agar IR verification bekerja.
+  const String safeFan = sanitizeFan(fan);
+  Serial.Printf("[Auto] Set %dÂ°C, mode=%s, fan=%s\n", temp, mode.c_str(), safeFan.c_str());
 
   if (sensorIsDisplayHealthy()) {
     DisplayFrame disp = sensorGetLastDisplayFrame();
@@ -458,10 +448,10 @@ static void applyTempModeFan(int temp, const String& mode, const String& fan) {
   lastActionMs = millis();
   lastActionSource = ACTION_AUTOMATION;
   
-  setExpectedState(true, mode, fan, (uint8_t)temp);
+  setExpectedState(true, mode, safeFan, (uint8_t)temp);
   
   StaticJsonDocument<256> doc;
-  doc["power"] = true; doc["temp"] = temp; doc["mode"] = mode; doc["fan"] = fan;
+  doc["power"] = true; doc["temp"] = temp; doc["mode"] = mode; doc["fan"] = safeFan;
   String jsonStr; serializeJson(doc, jsonStr);
   controllEnqueueCommand(jsonStr.c_str(), jsonStr.length());
 }
@@ -495,8 +485,8 @@ static void controlAC(bool power, String mode, int temp, String fanSpeed = "") {
         fanSpeed = rFan;
         Serial.Printf("[Auto] Using period target fan: %s\n", fanSpeed.c_str());
       } else {
-        fanSpeed = "AUTO";
-        Serial.Println("[Auto] No target fan found, using AUTO");
+        fanSpeed = "LOW";
+        Serial.Println("[Auto] No target fan found, using LOW");
       }
     }
     
@@ -532,26 +522,12 @@ static bool computeAutomationShouldBeOnNow(bool& shouldBeOn) {
   return true;
 }
 
-static void checkAndFixMode() {
-  BPFrame frame = sensorGetLastFrame();
-  if (!frame.valid) return;
-  
-  const TimePeriod* tp = getActiveTimePeriod();
-  if (!tp) return;
-  
-  String cMode = frame.mode; 
-  String kMode = resolveMode(tp);
-  cMode.toUpperCase(); kMode.toUpperCase();
-  
-  if (cMode != kMode) applyModeOnly(kMode);
-}
-
 // =================================================================
-// [NEW] TEMPERATURE MAINTENANCE - SIMPLIFIED LOGIC
+// TEMPERATURE MAINTENANCE
 // Alur:
-// 1. Suhu dalam range (min_temp <= suhu <= max_temp) → No action
-// 2. Suhu > max_temp → Set temp, fan HIGH, 3x retry lalu temp-2
-// 3. Suhu < min_temp → Set temp, fan LOW
+// 1. Suhu dalam range (min_temp <= suhu <= max_temp) â†’ No action
+// 2. Suhu > max_temp â†’ Set temp, fan MEDIUM, 3x retry lalu temp-2
+// 3. Suhu < min_temp â†’ Set temp, fan LOW
 // =================================================================
 static void checkAndMaintainTemperature() {
   if (!getACPowerStatus()) {
@@ -578,6 +554,10 @@ static void checkAndMaintainTemperature() {
     }
     return;
   }
+  if (isDryModeWindowActive(tp)) {
+    coolingAttemptCount = 0;
+    return;
+  }
 
   int currentTemp = frame.current_temp;
   int setTemp = resolveSetTemp(tp);
@@ -586,9 +566,9 @@ static void checkAndMaintainTemperature() {
   String targetMode = resolveMode(tp);
   String targetFan = resolveFan(tp);
 
-  // ═════════════════════════════════════════════════════════════
-  // CASE 1: SUHU DALAM RANGE → CHECK FAN SPEED
-  // ═════════════════════════════════════════════════════════════
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // CASE 1: SUHU DALAM RANGE â†’ CHECK FAN SPEED
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
   if (currentTemp >= minTemp && currentTemp <= maxTemp) {
     // Reset counter jika suhu kembali normal
     if (coolingAttemptCount > 0) {
@@ -599,10 +579,8 @@ static void checkAndMaintainTemperature() {
     // Check if fan speed matches default_fan setting
     String currentFan = frame.fan;
     String defaultFan = targetFan;
-    currentFan.toUpperCase();
-    defaultFan.toUpperCase();
-    currentFan.trim();
-    defaultFan.trim();
+    currentFan = normalizeFanSpeed(currentFan);
+    defaultFan = normalizeFanSpeed(defaultFan);
     
     if (currentFan != defaultFan) {
       Serial.Printf("[Auto] Temperature OK but fan mismatch: %s != %s, adjusting...\n", 
@@ -624,12 +602,12 @@ static void checkAndMaintainTemperature() {
     return;
   }
 
-  // ═════════════════════════════════════════════════════════════
-  // CASE 2: SUHU > MAX_TEMP → COOLING MODE
-  // ═════════════════════════════════════════════════════════════
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // CASE 2: SUHU > MAX_TEMP â†’ COOLING MODE
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
   if (currentTemp > maxTemp) {
     coolingAttemptCount++;
-    Serial.Printf("[Auto] Too hot: %d°C > %d°C (attempt %d/3)\n", 
+    Serial.Printf("[Auto] Too hot: %dÂ°C > %dÂ°C (attempt %d/3)\n", 
               currentTemp, maxTemp, coolingAttemptCount);
     
     lastTempControlMs = now;
@@ -639,7 +617,7 @@ static void checkAndMaintainTemperature() {
       int newSetTemp = setTemp - 2;
       if (newSetTemp < 16) newSetTemp = 16; // Min AC limit
       
-      Serial.Printf("[Auto] 3x cooling failed, lowering setpoint: %d°C → %d°C\n", 
+      Serial.Printf("[Auto] 3x cooling failed, lowering setpoint: %dÂ°C â†’ %dÂ°C\n", 
                 setTemp, newSetTemp);
       
       if (frame.fan != "MEDIUM") {
@@ -650,8 +628,8 @@ static void checkAndMaintainTemperature() {
       // Reset counter setelah menurunkan setpoint
       coolingAttemptCount = 0;
     } else {
-      // Normal cooling: set_temp, fan HIGH
-      Serial.Printf("[Auto] Cooling action: %d°C, fan=HIGH\n", setTemp);
+      // Normal cooling: set_temp, fan MEDIUM
+      Serial.Printf("[Auto] Cooling action: %dÂ°C, fan=MEDIUM\n", setTemp);
       
       if (frame.fan != "MEDIUM") {
         activityTrackFan(frame.fan, "MEDIUM", SOURCE_AUTOMATION);
@@ -662,19 +640,19 @@ static void checkAndMaintainTemperature() {
     return;
   }
 
-  // ═════════════════════════════════════════════════════════════
-  // CASE 3: SUHU < MIN_TEMP → WARMING MODE
-  // ═════════════════════════════════════════════════════════════
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+  // CASE 3: SUHU < MIN_TEMP â†’ WARMING MODE
+  // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
   if (currentTemp < minTemp) {
     // Reset cooling counter
     coolingAttemptCount = 0;
     
-    Serial.Printf("[Auto] Too cold: %d°C < %d°C\n", currentTemp, minTemp);
+    Serial.Printf("[Auto] Too cold: %dÂ°C < %dÂ°C\n", currentTemp, minTemp);
     
     lastTempControlMs = now;
     
     // Set ke set_temp dengan fan LOW
-    Serial.Printf("[Auto] Warming action: %d°C, fan=LOW\n", setTemp);
+    Serial.Printf("[Auto] Warming action: %dÂ°C, fan=LOW\n", setTemp);
     
     if (frame.fan != "LOW") {
       activityTrackFan(frame.fan, "LOW", SOURCE_AUTOMATION);
@@ -718,10 +696,10 @@ void monitorExternalChange() {
     unsigned long now = millis();
 
     if (bpPowerChanged) {
-      Serial.Printf("[Monitor-BP] Power Change: %s → %s (Display invalid)\n",
+      Serial.Printf("[Monitor-BP] Power Change: %s â†’ %s (Display invalid)\n",
                 lastKnownBpPower ? "ON" : "OFF", mainboard.power ? "ON" : "OFF");
     } else {
-      Serial.Printf("[Monitor-BP] Non-power change (Display invalid): mode=%s→%s fan=%s→%s\n",
+      Serial.Printf("[Monitor-BP] Non-power change (Display invalid): mode=%sâ†’%s fan=%sâ†’%s\n",
                 lastKnownBpMode.c_str(), mainboard.mode.c_str(),
                 lastKnownBpFan.c_str(), mainboard.fan.c_str());
     }
@@ -746,7 +724,7 @@ void monitorExternalChange() {
       }
 
       if (ok) {
-        Serial.Println("[Monitor-BP] ✓ Change matches expected state (MQTT/Automation)");
+        Serial.Println("[Monitor-BP] âœ“ Change matches expected state (MQTT/Automation)");
         clearExpectedState();
         lastActionSource = ACTION_NONE;
         lastKnownBpPower = mainboard.power;
@@ -789,19 +767,19 @@ void monitorExternalChange() {
 
     // Non-power change: resync ke state automation (set temp tetap dari config, bukan dari BP).
     if (!bpPowerChanged) {
-      Serial.Println("╔═══════════════════════════════════════╗");
-      Serial.Println("║ ⚠️ PHYSICAL REMOTE CHANGE DETECTED    ║");
-      Serial.Println("║ Source: IR Remote / Panel Button      ║");
-      Serial.Println("║ (Display invalid) -> RESYNC AUTOMATION║");
+      Serial.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+      Serial.Println("â•‘ âš ï¸ PHYSICAL REMOTE CHANGE DETECTED    â•‘");
+      Serial.Println("â•‘ Source: IR Remote / Panel Button      â•‘");
+      Serial.Println("â•‘ (Display invalid) -> RESYNC AUTOMATIONâ•‘");
       if (bpModeChanged) {
-        Serial.Printf("║ Mode(BP): %s → %s                 ║\n",
+        Serial.Printf("â•‘ Mode(BP): %s â†’ %s                 â•‘\n",
                   lastKnownBpMode.c_str(), mainboard.mode.c_str());
       }
       if (bpFanChanged) {
-        Serial.Printf("║ Fan(BP): %s → %s                  ║\n",
+        Serial.Printf("â•‘ Fan(BP): %s â†’ %s                  â•‘\n",
                   lastKnownBpFan.c_str(), mainboard.fan.c_str());
       }
-      Serial.Println("╚═══════════════════════════════════════╝");
+      Serial.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
 
       if (bpModeChanged && mainboard.power) {
         activityTrackMode(lastKnownBpMode, mainboard.mode, SOURCE_PHYSICAL_REMOTE);
@@ -816,10 +794,6 @@ void monitorExternalChange() {
       String targetMode = resolveMode(tp);
       int targetSetTemp = resolveSetTemp(tp);
       String resyncFan = resolveFan(tp);
-
-      if (resyncFan == "AUTO" && mainboard.valid) {
-        resyncFan = selectOptimalFanSpeed(mainboard.current_temp, targetSetTemp);
-      }
 
       lastKnownBpPower = mainboard.power;
       lastKnownBpMode = mainboard.mode;
@@ -836,21 +810,19 @@ void monitorExternalChange() {
     }
 
     // Physical remote power change detected -> masuk manual recovery.
-    Serial.Println("╔═══════════════════════════════════════╗");
-    Serial.Println("║ ⚠️ PHYSICAL REMOTE POWER DETECTED     ║");
-    Serial.Println("║ Source: IR Remote / Panel Button      ║");
-    Serial.printf("║ Power: %s → %s                    ║\n",
+    Serial.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+    Serial.Println("â•‘ âš ï¸ PHYSICAL REMOTE POWER DETECTED     â•‘");
+    Serial.Println("â•‘ Source: IR Remote / Panel Button      â•‘");
+    Serial.printf("â•‘ Power: %s â†’ %s                    â•‘\n",
             lastKnownBpPower ? "ON" : "OFF", mainboard.power ? "ON" : "OFF");
-    Serial.Println("║ -> Manual Recovery ACTIVE             ║");
-    Serial.Println("╚═══════════════════════════════════════╝");
+    Serial.Println("â•‘ -> Manual Recovery ACTIVE             â•‘");
+    Serial.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
 
     manualOverrideCount++;
     Serial.Printf("[Auto] Manual Override Count: %lu\n", manualOverrideCount);
     activityTrackPower(lastKnownBpPower, mainboard.power, SOURCE_PHYSICAL_REMOTE);
 
     cfg.setting.automation = false;
-    cfg.setting.manualModeActive = true;
-    cfg.setting.lastManualControlMs = now;
 
     if (cfgSave()) {
       cfgApply();
@@ -890,36 +862,20 @@ void monitorExternalChange() {
   bool modeChanged = disp.mode != lastKnownMode;
   bool fanChanged = disp.fan != lastKnownFan;
 
-  if (fanChanged && !powerChanged && !modeChanged && !setTempChanged) {
-    // Check if this fan change matches intelligent control expectation
-    int currentTemp = mainboard.valid ? mainboard.current_temp : lastKnownCurrentTemp;
-    int targetTemp = resolveSetTemp(getActiveTimePeriod());
-    bool isIntelligentChange = isIntelligentFanChange(
-      lastKnownFan, 
-      disp.fan, 
-      currentTemp, 
-      targetTemp
-    );
-    
-    if (isIntelligentChange) {
-      Serial.Printf("[Monitor] Fan changed: %s → %s (Intelligent Control - Ignored)\n", 
-                lastKnownFan.c_str(), disp.fan.c_str());
-      
-      lastKnownFan = disp.fan;
-      fanChanged = false;
-    }
-  }
-
-  if (setTempChanged && !powerChanged && !modeChanged && !fanChanged) {
+  // Semua perubahan set temperature dari remote fisik harus masuk ke jalur
+  // resync automation, termasuk nilai yang dahulu dianggap masih dalam range.
+  // Legacy in-range override path is intentionally disabled. All set_temp
+  // changes must continue to the common automation resync path below.
+  if (false && setTempChanged && !powerChanged && !modeChanged && !fanChanged) {
     const TimePeriod* tp = getActiveTimePeriod();
     uint8_t minTemp = resolveMinTemp(tp);
     uint8_t maxTemp = resolveMaxTemp(tp);
     uint8_t newSetTemp = disp.set_temp;
     
     if (newSetTemp >= minTemp && newSetTemp <= maxTemp) {
-      Serial.Printf("[Monitor] Set temp changed: %d → %d (Within range [%d-%d] - Allowed)\n", 
+      Serial.Printf("[Monitor] Set temp changed: %d â†’ %d (Within range [%d-%d] - Allowed)\n", 
                 lastKnownSetTemp, newSetTemp, minTemp, maxTemp);
-      Serial.Println("[Monitor] → No manual recovery triggered");
+      Serial.Println("[Monitor] â†’ No manual recovery triggered");
 
       // Simpan override set_temp (allowed) supaya koreksi fan tidak memaksa balik.
       allowedSetTempOverrideActive = true;
@@ -940,7 +896,7 @@ void monitorExternalChange() {
       }
       return;
     } else {
-      Serial.Printf("[Monitor] Set temp changed: %d → %d (Outside range [%d-%d])\n", 
+      Serial.Printf("[Monitor] Set temp changed: %d â†’ %d (Outside range [%d-%d])\n", 
                 lastKnownSetTemp, newSetTemp, minTemp, maxTemp);
     }
   }
@@ -961,13 +917,13 @@ void monitorExternalChange() {
             lastKnownFan.c_str(), disp.fan.c_str());
 
   if (matchesExpectedState(disp)) {
-    Serial.Println("[Monitor] ✓ Change matches expected state (MQTT/Automation)");
-    Serial.Println("[Monitor] → No manual recovery triggered");
+    Serial.Println("[Monitor] âœ“ Change matches expected state (MQTT/Automation)");
+    Serial.Println("[Monitor] â†’ No manual recovery triggered");
     clearExpectedState();
     lastActionSource = ACTION_NONE;
   }
   else if (isExpectedStateValid()) {
-    Serial.Println("[Monitor] ⚠ Change does NOT match expected state");
+    Serial.Println("[Monitor] âš  Change does NOT match expected state");
     
     unsigned long timeSinceAction = now - lastActionMs;
     if (timeSinceAction <= ACTION_WINDOW_MS && lastActionSource != ACTION_NONE) {
@@ -975,17 +931,13 @@ void monitorExternalChange() {
       
       if (lastActionSource == ACTION_MQTT_REMOTE) {
         if (cfg.setting.manualModeActive) {
-          Serial.Println("[Monitor] ✓ MQTT Remote action (Manual recovery active)");
+          Serial.Println("[Monitor] MQTT Remote action - keep attribution (manual recovery active)");
         } else {
-          Serial.Println("[Monitor] ✓ MQTT Remote action (No manual recovery)");
+          Serial.Println("[Monitor] MQTT Remote action - keep attribution");
         }
-        clearExpectedState();
-        lastActionSource = ACTION_NONE;
       }
       else if (lastActionSource == ACTION_AUTOMATION) {
-        Serial.Println("[Monitor] ✓ Automation action - No manual recovery");
-        clearExpectedState();
-        lastActionSource = ACTION_NONE;
+        Serial.Println("[Monitor] Automation action - keep attribution");
       }
     }
     else {
@@ -997,15 +949,13 @@ void monitorExternalChange() {
     if (timeSinceAction <= ACTION_WINDOW_MS && lastActionSource != ACTION_NONE) {
       if (lastActionSource == ACTION_MQTT_REMOTE) {
         if (cfg.setting.manualModeActive) {
-          Serial.Println("[Monitor] ✓ Recent MQTT action detected (Manual recovery active)");
+          Serial.Println("[Monitor] Recent MQTT action detected - keep attribution (manual recovery active)");
         } else {
-          Serial.Println("[Monitor] ✓ Recent MQTT action detected (No manual recovery)");
+          Serial.Println("[Monitor] Recent MQTT action detected - keep attribution");
         }
-        lastActionSource = ACTION_NONE;
       }
       else if (lastActionSource == ACTION_AUTOMATION) {
-        Serial.Println("[Monitor] ✓ Recent Automation action detected - No manual recovery");
-        lastActionSource = ACTION_NONE;
+        Serial.Println("[Monitor] Recent Automation action detected - keep attribution");
       }
     }
     else {
@@ -1054,22 +1004,24 @@ physical_remote_detected:
   if (!powerChanged) {
     // Jika hanya set_temp berubah dan nilainya di luar range, lakukan RESYNC
     // ke target automation (temp+mode+fan) agar konsisten.
-    if (setTempChanged && !modeChanged && !fanChanged) {
+    // Legacy range-only path is intentionally disabled; set_temp changes are
+    // handled by the common non-power resync path below.
+    if (false && setTempChanged && !modeChanged && !fanChanged) {
       const TimePeriod* tp = getActiveTimePeriod();
       uint8_t minTemp = resolveMinTemp(tp);
       uint8_t maxTemp = resolveMaxTemp(tp);
       uint8_t newSetTemp = disp.set_temp;
 
       if (newSetTemp < minTemp || newSetTemp > maxTemp) {
-        Serial.Println("╔═══════════════════════════════════════╗");
-        Serial.Println("║ ⚠️ PHYSICAL REMOTE CHANGE DETECTED    ║");
-        Serial.Println("║ Source: IR Remote / Panel Button      ║");
-        Serial.Println("║ -> Set temp out-of-range: RESYNC AUTO ║");
-        Serial.Printf("║ Set Temp: %d → %d (Range: %d-%d)    ║\n",
+        Serial.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+        Serial.Println("â•‘ âš ï¸ PHYSICAL REMOTE CHANGE DETECTED    â•‘");
+        Serial.Println("â•‘ Source: IR Remote / Panel Button      â•‘");
+        Serial.Println("â•‘ -> Set temp out-of-range: RESYNC AUTO â•‘");
+        Serial.Printf("â•‘ Set Temp: %d â†’ %d (Range: %d-%d)    â•‘\n",
                   lastKnownSetTemp, disp.set_temp,
                   minTemp, maxTemp);
-        Serial.Printf("║ Restoring to: %d°C                 ║\n", resolveSetTemp(tp));
-        Serial.Println("╚═══════════════════════════════════════╝");
+        Serial.Printf("â•‘ Restoring to: %dÂ°C                 â•‘\n", resolveSetTemp(tp));
+        Serial.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
 
         // Track perubahan dari physical remote
         activityTrackTemp((int)lastKnownSetTemp, (int)disp.set_temp, SOURCE_PHYSICAL_REMOTE);
@@ -1089,10 +1041,6 @@ physical_remote_detected:
           String targetMode = resolveMode(tp);
           int targetSetTemp = resolveSetTemp(tp);
           String resyncFan = resolveFan(tp);
-
-          if (resyncFan == "AUTO" && mainboard.valid) {
-            resyncFan = selectOptimalFanSpeed(mainboard.current_temp, targetSetTemp);
-          }
           lastActionMs = millis();
           lastActionSource = ACTION_AUTOMATION;
           applyTempModeFan(targetSetTemp, targetMode, resyncFan);
@@ -1103,26 +1051,26 @@ physical_remote_detected:
       }
     }
 
-    Serial.Println("╔═══════════════════════════════════════╗");
-    Serial.Println("║ ⚠️ PHYSICAL REMOTE CHANGE DETECTED    ║");
-    Serial.Println("║ Source: IR Remote / Panel Button      ║");
-    Serial.Println("║ -> Non-power change: RESYNC AUTOMATION║");
+    Serial.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+    Serial.Println("â•‘ âš ï¸ PHYSICAL REMOTE CHANGE DETECTED    â•‘");
+    Serial.Println("â•‘ Source: IR Remote / Panel Button      â•‘");
+    Serial.Println("â•‘ -> Non-power change: RESYNC AUTOMATIONâ•‘");
     
     const TimePeriod* tp = getActiveTimePeriod();
     if (setTempChanged) {
-      Serial.Printf("║ Set Temp: %d → %d (Range: %d-%d)    ║\n",
+      Serial.Printf("â•‘ Set Temp: %d â†’ %d (Range: %d-%d)    â•‘\n",
                 lastKnownSetTemp, disp.set_temp,
                 resolveMinTemp(tp), resolveMaxTemp(tp));
     }
     if (modeChanged) {
-      Serial.Printf("║ Mode: %s → %s                     ║\n",
+      Serial.Printf("â•‘ Mode: %s â†’ %s                     â•‘\n",
                 lastKnownMode.c_str(), disp.mode.c_str());
     }
     if (fanChanged) {
-      Serial.Printf("║ Fan: %s → %s                      ║\n",
+      Serial.Printf("â•‘ Fan: %s â†’ %s                      â•‘\n",
                 lastKnownFan.c_str(), disp.fan.c_str());
     }
-    Serial.Println("╚═══════════════════════════════════════╝");
+    Serial.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
 
     // Track perubahan dari physical remote (tanpa masuk manual mode)
     if (setTempChanged) {
@@ -1139,10 +1087,6 @@ physical_remote_detected:
     String targetMode = resolveMode(tp);
     int targetSetTemp = resolveSetTemp(tp);
     String resyncFan = resolveFan(tp);
-    
-    if (resyncFan == "AUTO" && mainboard.valid) {
-      resyncFan = selectOptimalFanSpeed(mainboard.current_temp, targetSetTemp);
-    }
 
     // Update baseline agar tidak memicu berulang sebelum resync ter-apply
     lastKnownPower = disp.power;
@@ -1166,32 +1110,32 @@ physical_remote_detected:
     return;
   }
   
-  Serial.Println("╔═══════════════════════════════════════╗");
-  Serial.Println("║ ⚠️ PHYSICAL REMOTE CHANGE DETECTED    ║");
-  Serial.Println("║ Source: IR Remote / Panel Button      ║");
+  Serial.Println("â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—");
+  Serial.Println("â•‘ âš ï¸ PHYSICAL REMOTE CHANGE DETECTED    â•‘");
+  Serial.Println("â•‘ Source: IR Remote / Panel Button      â•‘");
   
   const TimePeriod* tp = getActiveTimePeriod();
 
   if (powerChanged) {
-    Serial.Printf("║ Power: %s → %s                    ║\n", 
+    Serial.Printf("â•‘ Power: %s â†’ %s                    â•‘\n", 
               lastKnownPower ? "ON" : "OFF", disp.power ? "ON" : "OFF");
   }
   if (setTempChanged) {
-    Serial.Printf("║ Set Temp: %d → %d (Range: %d-%d)    ║\n", 
+    Serial.Printf("â•‘ Set Temp: %d â†’ %d (Range: %d-%d)    â•‘\n", 
               lastKnownSetTemp, disp.set_temp, 
               resolveMinTemp(tp), resolveMaxTemp(tp));
   }
   if (modeChanged) {
-    Serial.Printf("║ Mode: %s → %s                     ║\n", 
+    Serial.Printf("â•‘ Mode: %s â†’ %s                     â•‘\n", 
               lastKnownMode.c_str(), disp.mode.c_str());
   }
   if (fanChanged) {
-    Serial.Printf("║ Fan: %s → %s                      ║\n", 
+    Serial.Printf("â•‘ Fan: %s â†’ %s                      â•‘\n", 
               lastKnownFan.c_str(), disp.fan.c_str());
   }
   
-  Serial.Println("║ -> Manual Recovery ACTIVE             ║");
-  Serial.Println("╚═══════════════════════════════════════╝");
+  Serial.Println("â•‘ -> Manual Recovery ACTIVE             â•‘");
+  Serial.Println("â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•");
 
   // Track specific changes from physical remote
   if (powerChanged) {
@@ -1224,10 +1168,6 @@ physical_remote_detected:
     String targetMode = resolveMode(tp);
     int targetSetTemp = resolveSetTemp(tp);
     String resyncFan = resolveFan(tp);
-    
-    if (resyncFan == "AUTO" && mainboard.valid) {
-      resyncFan = selectOptimalFanSpeed(mainboard.current_temp, targetSetTemp);
-    }
 
     if (!disp.power) {
       activityTrackPower(false, true, SOURCE_AUTOMATION);
@@ -1252,31 +1192,6 @@ physical_remote_detected:
   forceScheduleCheck = true;
 }
 
-static void checkAutoRecovery() {
-  if (!cfg.setting.manualModeActive) return;
-
-  unsigned long now = millis();
-  if (now - lastRecoveryCheckMs < RECOVERY_CHECK_INTERVAL_MS) return;
-  lastRecoveryCheckMs = now;
-
-  unsigned long recoveryMs = (unsigned long)cfg.setting.auto_recovery_sec * 1000UL; 
-
-  unsigned long elapsedMs = now - cfg.setting.lastManualControlMs;
-
-  if (elapsedMs >= recoveryMs) return;
-  
-  long remMs = recoveryMs - elapsedMs;
-  if (remMs < 0) remMs = 0;
-
-  unsigned long rSec = remMs / 1000UL;
-
-  static unsigned long lastLogMs = 0;
-  if (now - lastLogMs >= 10000 || rSec <= 10) {
-    Serial.Printf("[Auto-Recovery] ⏳ Manual mode - Recovery in %lu:%02lu\n", rSec / 60, rSec % 60);
-    lastLogMs = now;
-  }
-}
-
 void automationInit() {
   Serial.Printf("[Auto] Init State: %s\n", cfg.setting.automation ? "ON" : "OFF");
   
@@ -1285,14 +1200,11 @@ void automationInit() {
     cfg.setting.manualModeActive = false;
   }
   
-  lastAutomationState = cfg.setting.automation;
-  lastRecoveryCheckMs = millis();
   lastScheduleCheckMs = millis(); 
   forceScheduleCheck = true; 
 }
 
 void automationCheck() {
-  checkAutoRecovery();
   unsigned long now = millis();
 
   // Jika target set_temp automation berubah, hapus override set_temp dari physical remote
@@ -1312,7 +1224,7 @@ void automationCheck() {
     }
 
     if (irVerifyStartMs > 0 && (now - irVerifyStartMs) > IR_VERIFY_TIMEOUT_MS) {
-      Serial.Println("[Auto] ⚠️ IR verification timeout");
+      Serial.Println("[Auto] âš ï¸ IR verification timeout");
       waitingForACResponse = false;
       irVerifyRetryCount = 0;
       irVerifyStartMs = 0;
@@ -1332,7 +1244,7 @@ void automationCheck() {
         lastIRCommandMs = now;
         return;
       } else {
-        Serial.Println("[Auto] ⚠️ AC not responding after 3 retries");
+        Serial.Println("[Auto] âš ï¸ AC not responding after 3 retries");
         waitingForACResponse = false;
         irVerifyRetryCount = 0;
         irVerifyStartMs = 0;
@@ -1344,9 +1256,9 @@ void automationCheck() {
     unsigned long recoveryMs = (unsigned long)cfg.setting.auto_recovery_sec * 1000UL;
     if (now - cfg.setting.lastManualControlMs >= recoveryMs) {
       // Jika user secara eksplisit mematikan automation via MQTT,
-      // jangan re-enable otomatis — hanya clear manual mode.
+      // jangan re-enable otomatis â€” hanya clear manual mode.
       if (cfg.setting.automationPausedByUser) {
-        Serial.Println("[Auto] Recovery timer habis, tapi automation di-disable oleh user — tetap OFF");
+        Serial.Println("[Auto] Recovery timer habis, tapi automation di-disable oleh user â€” tetap OFF");
         cfg.setting.manualModeActive = false;
         if (cfgSave()) {
           cfgApply();
@@ -1375,10 +1287,6 @@ void automationCheck() {
       String targetMode = resolveMode(tp);
       
       BPFrame currentFrame = sensorGetLastFrame();
-      
-      if (optimalFan == "AUTO" && currentFrame.valid) {
-        optimalFan = selectOptimalFanSpeed(currentFrame.current_temp, targetSetTemp);
-      }
       
       if (currentFrame.valid) {
         if (!currentFrame.power) {
@@ -1424,7 +1332,8 @@ void automationCheck() {
       Serial.println("[Auto] Force schedule evaluation triggered");
       lastForceScheduleLogMs = now;
     }
-    lastTempControlMs = 0;
+    // Reset schedule check timer so it re-evaluates immediately,
+    // but do NOT reset lastTempControlMs â€” temperature cooldown must be preserved.
     lastScheduleCheckMs = 0;
     scheduleStateInit = false;
   }
@@ -1435,7 +1344,6 @@ void automationCheck() {
   lastScheduleCheckMs = now;
 
   if (!cfg.setting.automation) {
-    lastTempControlMs = 0;
     if (forceScheduleCheck) forceScheduleCheck = false;
     return;
   }
@@ -1447,22 +1355,21 @@ void automationCheck() {
   if (!wifiOk && !rtcOk) {
     static unsigned long lastWarnMs = 0;
     if (now - lastWarnMs > 30000) {
-      Serial.Println("[Auto] ⚠️ WiFi dan RTC tidak tersedia - automation dimatikan");
+      Serial.Println("[Auto] âš ï¸ WiFi dan RTC tidak tersedia - automation dimatikan");
       lastWarnMs = now;
     }
-    lastTempControlMs = 0;
     if (forceScheduleCheck) forceScheduleCheck = false;
     return;
   } else if (!rtcOk) {
     static unsigned long lastWarnMs = 0;
     if (now - lastWarnMs > 60000) {
-      Serial.Println("[Auto] ⚠️ RTC tidak tersedia, menggunakan NTP dari WiFi");
+      Serial.Println("[Auto] âš ï¸ RTC tidak tersedia, menggunakan NTP dari WiFi");
       lastWarnMs = now;
     }
   } else if (!wifiOk) {
     static unsigned long lastWarnMs = 0;
     if (now - lastWarnMs > 60000) {
-      Serial.Println("[Auto] ⚠️ WiFi tidak tersedia, menggunakan RTC");
+      Serial.Println("[Auto] âš ï¸ WiFi tidak tersedia, menggunakan RTC");
       lastWarnMs = now;
     }
   }
@@ -1471,7 +1378,7 @@ void automationCheck() {
   if (dayIdx < 0) {
     static unsigned long lastWarnMs = 0;
     if (now - lastWarnMs > 30000) {
-      Serial.Println("[Auto] ⚠️ Gagal mendapatkan waktu - skip cycle");
+      Serial.Println("[Auto] âš ï¸ Gagal mendapatkan waktu - skip cycle");
       lastWarnMs = now;
     }
     return;
@@ -1480,6 +1387,18 @@ void automationCheck() {
   const TimePeriod* activePeriod = getActiveTimePeriod();
   DaySchedule &d = cfg.setting.daily[dayIdx];
   bool shouldBeOn = (activePeriod != nullptr);
+  bool dryModeActive = shouldBeOn && isDryModeWindowActive(activePeriod);
+  String scheduleTargetMode = dryModeActive ? String("DRY") : resolveMode(activePeriod);
+  String scheduleTargetFan = dryModeActive ? String("") : resolveFan(activePeriod);
+  int scheduleTargetTemp = dryModeActive ? -1 : resolveSetTemp(activePeriod);
+  bool targetChanged = shouldBeOn &&
+                       scheduleTargetChanged(scheduleTargetMode,
+                                             scheduleTargetFan,
+                                             scheduleTargetTemp);
+  if (dryModeActive != lastDryModeWindowActive) {
+    Serial.Printf("[Auto] DRY startup window: %s\n", dryModeActive ? "ACTIVE" : "INACTIVE");
+    lastDryModeWindowActive = dryModeActive;
+  }
   
   if (!logStateInit || shouldBeOn != lastLoggedShouldBeOn) {
     Serial.Printf("[Auto] DayIdx=%d (Day=%d), Type=%d, ShouldBeOn=%s\n",
@@ -1494,7 +1413,7 @@ void automationCheck() {
     if (!currentFrame.valid) {
       static unsigned long lastWaitValidFrameLogMs = 0;
       if (lastWaitValidFrameLogMs == 0 || (now - lastWaitValidFrameLogMs) >= 10000UL) {
-        Serial.println("[Auto] ⏳ Waiting for valid frame... No IR command sent");
+        Serial.println("[Auto] â³ Waiting for valid frame... No IR command sent");
         lastWaitValidFrameLogMs = now;
       }
       return;
@@ -1503,26 +1422,23 @@ void automationCheck() {
     if (!getACPowerStatus()) {
        Serial.Println("[Auto] Schedule ON -> Turning AC ON with intelligent fan");
        
-       // ═══════════════════════════════════════════════
+       // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
        // INCREMENT COUNTER untuk automation ON
-       // ═══════════════════════════════════════════════
+       // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
        autoOnCount++;
        Serial.Printf("[Auto] Auto ON Count: %lu\n", autoOnCount);
-       
-       String startupFan = resolveFan(activePeriod);
-       String startupMode = resolveMode(activePeriod);
-       int startupSetTemp = resolveSetTemp(activePeriod);
-
-       if (startupFan == "AUTO" && currentFrame.valid) {
-         startupFan = selectOptimalFanSpeed(currentFrame.current_temp, startupSetTemp);
-       }
        
        // Track activity before executing
        if (currentFrame.valid && !currentFrame.power) {
          activityTrackPower(false, true, SOURCE_AUTOMATION);
        }
        
-      controlAC(true, startupMode, startupSetTemp, startupFan);
+      if (dryModeActive) {
+        applyModeOnly("DRY");
+      } else {
+        controlAC(true, scheduleTargetMode, scheduleTargetTemp, scheduleTargetFan);
+      }
+       rememberScheduleTarget(scheduleTargetMode, scheduleTargetFan, scheduleTargetTemp);
        lastSchedulePower = true;
        lastActionMs = millis();
        lastActionSource = ACTION_AUTOMATION;
@@ -1536,22 +1452,23 @@ void automationCheck() {
     else {
        BPFrame lastFrame = sensorGetLastFrame();
       String currentMode = lastFrame.mode;
-      String targetMode = resolveMode(activePeriod);
+       bool modeMismatch = (currentMode != scheduleTargetMode);
        
-       bool modeMismatch = (currentMode != targetMode);
-       
-       if (isForceCheck || modeMismatch) {
+       if (isForceCheck || modeMismatch || targetChanged) {
            Serial.Println("[Auto] Syncing State (Mode/Temp config changed)...");
-           Serial.Printf("[Auto] Mode: %s -> %s\n", currentMode.c_str(), targetMode.c_str());
+           Serial.Printf("[Auto] Target: mode=%s fan=%s temp=%d\n",
+                         scheduleTargetMode.c_str(),
+                         scheduleTargetFan.c_str(),
+                         scheduleTargetTemp);
            
-           String syncFan = resolveFan(activePeriod);
-           int syncSetTemp = resolveSetTemp(activePeriod);
-           
-           if (syncFan == "AUTO" && lastFrame.valid) {
-             syncFan = selectOptimalFanSpeed(lastFrame.current_temp, syncSetTemp);
+           if (dryModeActive) {
+             applyModeOnly("DRY");
+           } else {
+             controlAC(true,
+                       scheduleTargetMode,
+                       scheduleTargetTemp,
+                       scheduleTargetFan);
            }
-           
-           controlAC(true, targetMode, syncSetTemp, syncFan);
            
            waitingForACResponse = true;
            expectedACState = true;
@@ -1559,6 +1476,7 @@ void automationCheck() {
            irVerifyStartMs = now;
            irVerifyRetryCount = 0;
        }
+       rememberScheduleTarget(scheduleTargetMode, scheduleTargetFan, scheduleTargetTemp);
        lastSchedulePower = true;
     }
   } 
@@ -1568,7 +1486,7 @@ void automationCheck() {
     if (!currentFrame.valid) {
       static unsigned long lastWaitValidFrameLogMs = 0;
       if (lastWaitValidFrameLogMs == 0 || (now - lastWaitValidFrameLogMs) >= 10000UL) {
-        Serial.println("[Auto] ⏳ Waiting for valid frame... No IR command sent");
+        Serial.println("[Auto] â³ Waiting for valid frame... No IR command sent");
         lastWaitValidFrameLogMs = now;
       }
       return;
@@ -1577,9 +1495,9 @@ void automationCheck() {
     if (getACPowerStatus()) {
        Serial.Println("[Auto] Schedule OFF -> Turning AC OFF");
        
-       // ═══════════════════════════════════════════════
+       // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
        // INCREMENT COUNTER untuk automation OFF
-       // ═══════════════════════════════════════════════
+       // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
        autoOffCount++;
        Serial.Printf("[Auto] Auto OFF Count: %lu\n", autoOffCount);
        
@@ -1599,29 +1517,32 @@ void automationCheck() {
        lastActionMs = millis();
        lastActionSource = ACTION_AUTOMATION;
     }
+    lastScheduleTargetValid = false;
     lastSchedulePower = false;
   }
 
-  if (shouldBeOn && !waitingForACResponse) {
-    checkAndMaintainTemperature();
-  }
+  // Temperature/fan maintenance is intentionally disabled. Automation follows
+  // the active schedule only and must not alter set_temp or fan speed from
+  // room temperature measurements.
 
   if (!scheduleStateInit) scheduleStateInit = true;
   if (forceScheduleCheck) forceScheduleCheck = false;
 }
 
 void automationSetExpectedStateFromMqtt(bool power, const String& mode, const String& fan, uint8_t setTemp) {
-  // Guard with mutex — this may be called from NetworkTask while AutoTask reads the same state.
+  // Guard with mutex â€” this may be called from NetworkTask while AutoTask reads the same state.
   // String assignments are NOT atomic and can corrupt without synchronization.
   if (g_cfgMutex && CFG_LOCK() == pdTRUE) {
     lastActionMs = millis();
     lastActionSource = ACTION_MQTT_REMOTE;
     setExpectedState(power, mode, fan, setTemp);
     CFG_UNLOCK();
-  } else {
-    // Fallback without lock
-    lastActionMs = millis();
-    lastActionSource = ACTION_MQTT_REMOTE;
-    setExpectedState(power, mode, fan, setTemp);
+  }
+}
+
+void automationClearExpectedStateFromMqtt() {
+  if (g_cfgMutex && CFG_LOCK() == pdTRUE) {
+    clearExpectedState();
+    CFG_UNLOCK();
   }
 }

@@ -16,7 +16,12 @@ enum DisconnectReason {
   REASON_MQTT_LOST,     // WiFi ada, tapi MQTT timeout
   REASON_WDT_RESET,     // Watchdog Reset (Crash / Hang)
   REASON_CRASH,         // Software panic / exception
-  REASON_MANUAL         // Sengaja diputus (Save Config)
+  REASON_MANUAL,        // Sengaja diputus (Save Config)
+  REASON_USB_RESET,     // Reset oleh peripheral USB
+  REASON_JTAG_RESET,    // Reset oleh JTAG
+  REASON_EFUSE_RESET,   // Reset akibat error eFuse
+  REASON_POWER_GLITCH,  // Gangguan daya singkat
+  REASON_CPU_LOCKUP     // CPU lockup / double exception
 };
 
 // ==========================================
@@ -43,12 +48,21 @@ bool dataIsPublishReady();
 void dataForceConnect();
 void dataResetConnection();
 void dataDisconnect(); // Tambahkan deklarasi ini jika belum ada
+void dataPauseMqttForOta();
+void dataResumeMqttAfterOta();
 void dataNotifyOffline();  // Publish retained offline setelah retry gagal 3x
 void dataScheduleImmediateWiFiRetry();
+bool dataConsumeImmediateWiFiRetryRequest();
+bool dataIsWiFiCredentialTrialActive();
+bool dataIsWiFiCredentialTrialExpired();
+void dataOnWiFiCredentialTrialFailedAfterRetries();
+void dataOnNetworkConnected();
 
 // Fungsi Publish
 void dataPublishSuhu(const BPFrame& d, bool read_ok);
 void dataPublishSetting();
+bool dataPublishSettingDay(uint8_t day);
+void dataPublishSettingDays(uint8_t dayMask);
 bool dataPublishInfo();
 void publishStatus(const String& status);
 bool dataPublishRaw(const String& topic, const String& payload);

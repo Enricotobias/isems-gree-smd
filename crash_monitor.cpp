@@ -64,6 +64,11 @@ String getDetailedResetReason() {
     case ESP_RST_DEEPSLEEP: return "Wake from Deep Sleep";
     case ESP_RST_BROWNOUT: return "Brownout Detector (Low Voltage)";
     case ESP_RST_SDIO: return "SDIO Reset";
+    case ESP_RST_USB: return "USB Peripheral Reset";
+    case ESP_RST_JTAG: return "JTAG Reset";
+    case ESP_RST_EFUSE: return "eFuse Error Reset";
+    case ESP_RST_PWR_GLITCH: return "Power Glitch Reset";
+    case ESP_RST_CPU_LOCKUP: return "CPU Lockup / Double Exception";
     default: return "Unknown Reset (" + String((int)reason) + ")";
   }
 }
@@ -87,6 +92,7 @@ void crashMonitorInit() {
   
   switch(reason) {
     case ESP_RST_PANIC:
+    case ESP_RST_CPU_LOCKUP:
       crashCount++;
       totalCrashes++;
       panicResets++;
@@ -147,10 +153,10 @@ void crashMonitorInit() {
   if (crashRate > 15.0 && totalBoots > 10) {
     Serial.println("╔════════════════════════════════════════╗");
     Serial.println("║   🚨 CRITICAL CRASH RATE 🚨           ║");
-    Serial.println("║   Triggering Factory Reset...         ║");
+    Serial.println("║   Preserving config, resetting stats  ║");
     Serial.println("╚════════════════════════════════════════╝");
     delay(2000);
-    cfgFormatLittleFS();
+    saveCrashStats(0, 0, 0, 0, 0, 0);
     ESP.restart();
   }
 }

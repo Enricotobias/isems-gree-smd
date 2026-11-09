@@ -6,6 +6,7 @@
 #include "crash_monitor.h"
 #include "data.h"
 #include "controll.h"
+#include "runtime_health.h"
 #include "automation.h"
 #include "ir_health.h"
 #include "esp_task_wdt.h"
@@ -53,10 +54,6 @@ const unsigned long REBOOT_TIMEOUT = 15 * 60 * 1000UL; // 15 Menit
 
 // Note: lastAutomationMs, lastPublishMs, lastWifiRetryMs, lastMqttRetryMs, lastReadUnitState
 // are now local variables in TaskNetwork_MQTT.
-
-// Stub: WiFi reconnect is now handled autonomously by TaskNetwork_MQTT.
-// data.cpp still calls this; keeping as no-op to avoid compilation errors.
-void dataScheduleImmediateWiFiRetry() { /* no-op */ }
 
 volatile bool wifiOK = false;
 volatile bool mqttOK = false;
@@ -304,22 +301,16 @@ void updateLEDStatus() {
 }
 
 void checkNetworkHealth() {
-  // Update mqttOK to reflect actual MQTT connection state
+  // Connectivity loss is an expected offline mode; do not reboot solely for it.
   mqttOK = dataIsConnected();
-  
-  // GANTI: mqtt.connected() -> dataIsConnected()
-  // Karena 'mqtt' tersembunyi di data.cpp, kita pakai fungsi publiknya
   if (WiFi.status() == WL_CONNECTED && dataIsConnected()) {
-
     lastConnectionTime = millis();
-  } 
-  // Jika salah satu putus, timer tidak di-update (membiarkan waktu berjalan)
-  // Cek apakah sudah terlalu lama putus?
-  if (millis() - lastConnectionTime > REBOOT_TIMEOUT) {
-    Serial.println("xx CRITICAL: Network Down > 15 mins. Force Restarting! xx");
-    delay(1000);
-    feedWatchdogAndYield();
-    ESP.restart(); // <--- Paksa Reboot
+  } else {
+    static uint32_t lastOfflineLog = 0;
+    if (millis() - lastOfflineLog >= 300000UL) {
+      lastOfflineLog = millis();
+      Serial.println("[NETWORK] Offline mode; reconnect will continue without reboot");
+    }
   }
 }
 
@@ -327,6 +318,7 @@ void setup() {
   Serial.begin(115200);
   ensureTaskWatchdogReady();
   delay(200);
+  Serial.printf("[BOOT] reset_reason=%d heap=%u\n", (int)esp_reset_reason(), ESP.getFreeHeap());
   Serial.Println("\n=== ESP32-C3 AC Gree Control Setup ===\n");
 
   Serial.println("\n\n==============================");
@@ -335,6 +327,15 @@ void setup() {
   Serial.println("==============================\n");
 
   crashMonitorInit();
+
+  // Synchronization primitives must exist before config/sensor helpers use them.
+  g_cfgMutex = xSemaphoreCreateMutex();
+  g_sensorMutex = xSemaphoreCreateMutex();
+  g_irCmdQueue = xQueueCreate(IR_CMD_QUEUE_LEN, sizeof(IrCmdMsg));
+  configASSERT(g_cfgMutex);
+  configASSERT(g_sensorMutex);
+  configASSERT(g_irCmdQueue);
+
   // Initialize LED status indicators
   initLED();
 
@@ -342,7 +343,7 @@ void setup() {
   WiFi.persistent(false); // Don't save to flash
   WiFi.setAutoReconnect(true); // Enable auto reconnection
   WiFi.mode(WIFI_STA);
-  cfg.device_id = WiFi.macAddress();
+  cfg.device_id = getStableDeviceMac();
   Serial.Printf("[Setup] Device ID (MAC): %s\n", cfg.device_id.c_str());
   WiFi.mode(WIFI_OFF);
   delay(100);
@@ -401,6 +402,10 @@ void setup() {
   cfgApply();
   esp_task_wdt_reset();
   yield();
+
+  // Simpan default config di task terpisah agar operasi LittleFS tidak
+  // membebani stack loopTask pada jalur startup.
+  cfgStartDeferredDefaultSave();
 
   // 2. Syncron waktu sistem dari waktu RTC PCF8563T
   Serial.Println("[SETUP] 2. Sinkronisasi waktu RTC...");
@@ -488,9 +493,8 @@ void setup() {
   // === REVISI: HAPUS LOGIKA CONNECT DISINI ===
   if (wifiOK) {
     Serial.Println("[SETUP] 4. Init MQTT Config (Connect otomatis di Loop)...");
-    dataInit();
-    // Kita biarkan loop() yang menangani koneksi agar tidak blocking
-    // dan tidak membuat koneksi "zombie"
+    // [HAPUS] dataInit() tidak lagi dipanggil di sini untuk mencegah double SSL init mbedTLS
+    // dataInit() SEKARANG HANYA dipanggil 1x oleh TaskNetwork_MQTT
     esp_task_wdt_reset();
     yield();
   } else {
@@ -511,6 +515,10 @@ void setup() {
   yield();
   esp_task_wdt_reset();
   
+  // Validasi firmware dilakukan di sini (SEBELUM RTOS tasks dimulai)
+  // agar tidak terjadi race condition yang mengganggu MQTT connect
+  otaValidateFirmware();
+  
   // Inisialisasi IR control
   Serial.Println("[SETUP] 5a. Inisialisasi IR control...");
   controllInit();
@@ -518,24 +526,10 @@ void setup() {
   yield();
   
   Serial.Println("[SETUP] 5b. Baca data dari unit Gree...");
-  // Coba baca data beberapa kali untuk memastikan dapat frame yang valid
-  bool frameFound = false;
-  for (int i = 0; i < 12; i++) {
-    esp_task_wdt_reset();
-    yield();
-    
-    sensorPoll();
-    delay(250);
-    yield();
-    esp_task_wdt_reset();
-    
-    BPFrame testFrame = sensorGetLastFrame();
-    if (testFrame.valid) {
-      frameFound = true;
-      Serial.Printf("[SETUP] Frame valid ditemukan pada percobaan %d\n", i+1);
-      break;
-    }
-  }
+  // ESP32-C3 single-core: jangan polling UART lama di setup.
+  // TaskSensor akan mulai membaca frame setelah task dibuat, sehingga boot tidak tertahan.
+  sensorPoll();
+  delay(50);
   
   esp_task_wdt_reset();
   yield();
@@ -582,20 +576,13 @@ void setup() {
   // Set initial LED status
   updateLEDStatus();
 
-  g_cfgMutex = xSemaphoreCreateMutex();
-  g_sensorMutex = xSemaphoreCreateMutex();
-  g_irCmdQueue = xQueueCreate(IR_CMD_QUEUE_LEN, sizeof(IrCmdMsg));
-  configASSERT(g_cfgMutex);
-  configASSERT(g_sensorMutex);
-  configASSERT(g_irCmdQueue);
-
   // ESP32-C3 = single-core, all tasks on core 0 via xTaskCreate (not PinnedToCore)
   // Priority: Sensor(3) > Auto=Ctrl=Net(2) > Health(1)
-  xTaskCreateNetwork(TaskNetwork_MQTT, "NetTask", 8192, nullptr, 2, &g_taskNetwork);   // MQTT + WiFi management
-  xTaskCreate_RTOS(TaskSensor, "SnsTask", 4096, nullptr, 3, &g_taskSensor);             // Highest: UART must not miss data
-  xTaskCreate_RTOS(TaskAutomation, "AutoTask", 6144, nullptr, 2, &g_taskAutomation);    // Fast resync on external change
-  xTaskCreate_RTOS(TaskControl, "CtrlTask", 6144, nullptr, 2, &g_taskControl);          // IR execution (mostly idle)
-  xTaskCreate_RTOS(TaskHealth, "Health", 2048, nullptr, 1, &g_taskHealth);              // Lowest: monitoring only
+  if (!runtimeCreateTaskChecked(xTaskCreateNetwork(TaskNetwork_MQTT, "NetTask", 16384, nullptr, 2, &g_taskNetwork), "NetTask")) return;
+  if (!runtimeCreateTaskChecked(xTaskCreate_RTOS(TaskSensor, "SnsTask", 4096, nullptr, 3, &g_taskSensor), "SnsTask")) return;
+  if (!runtimeCreateTaskChecked(xTaskCreate_RTOS(TaskAutomation, "AutoTask", 6144, nullptr, 2, &g_taskAutomation), "AutoTask")) return;
+  if (!runtimeCreateTaskChecked(xTaskCreate_RTOS(TaskControl, "CtrlTask", 6144, nullptr, 2, &g_taskControl), "CtrlTask")) return;
+  if (!runtimeCreateTaskChecked(xTaskCreate_RTOS(TaskHealth, "Health", 2048, nullptr, 1, &g_taskHealth), "Health")) return;
   Serial.println("[Setup] FreeRTOS tasks created");
 
   Serial.Println("\n=== Setup Selesai ===\n");

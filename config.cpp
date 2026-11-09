@@ -8,13 +8,28 @@
 #include "data.h"
 #include "esp_task_wdt.h"
 #include "esp_sntp.h"
+#include "esp_mac.h"
+#include <new>
+
 
 RTC_PCF8563 rtc;
 
 const char* CONFIG_PATH = "/config.json";
+static const char* CONFIG_TMP_PATH = "/config.tmp";
+static const char* CONFIG_BAK_PATH = "/config.bak";
+static const char* SCHEDULE_PATH = "/schedule.bin";
+static const char* SCHEDULE_TMP_PATH = "/schedule.tmp";
+static const char* SCHEDULE_BAK_PATH = "/schedule.bak";
+static const char* SCHEDULE_NEW_PATH = "/schedule.new";
+static const size_t CONFIG_JSON_DOC_CAPACITY = 4096;
+static const size_t CONFIG_FILE_MAX_BYTES = 16384;
+static const uint32_t SCHEDULE_MAGIC = 0x53434847UL; // GCHS
+static const uint16_t SCHEDULE_VERSION_V1 = 1;
+static const uint16_t SCHEDULE_VERSION = 2;
+static const uint8_t SCHEDULE_V1_MAX_PERIODS = 5;
 
-const char* DEF_WIFI_SSID = "Atop Lt2";
-const char* DEF_WIFI_PASS = "Atop88ls";
+const char* DEF_WIFI_SSID = "IOT";
+const char* DEF_WIFI_PASS = "12345678";
 const char* DEF_MQTT_HOST = "mqtt.nicourbanindonesia.com";
 const uint16_t DEF_MQTT_PORT = 8883;  // Port 8883 untuk MQTT over SSL/TLS
 const char* DEF_MQTT_USER = "isems";
@@ -28,6 +43,19 @@ const char*  DEF_GLOBAL_MODE     = "COOL";
 const char*  DEF_GLOBAL_FAN      = "AUTO";
 const int    DEF_TEMP_COOLDOWN   = 300;
 const int    DEF_AUTO_RECOVERY   = 300;
+const int8_t DEF_TZ_OFFSET       = 7;     // WIB=7, WITA=8, WIT=9
+
+// Helper: buat POSIX TZ string dari offset
+static String cfgGetTZString(int8_t offset) {
+  const char* name;
+  switch (offset) {
+    case 7:  name = "WIB";  break;
+    case 8:  name = "WITA"; break;
+    case 9:  name = "WIT";  break;
+    default: name = "UTC";  break;
+  }
+  return String(name) + String(-offset);
+}
 
 static void feedWatchdogAndYield() {
   esp_task_wdt_reset();
@@ -35,20 +63,394 @@ static void feedWatchdogAndYield() {
 }
 
 Config cfg;
+static bool cfgRuntimeDefaultDueLoadFailure = false;
+static bool cfgDeferredDefaultSaveStarted = false;
 
 static Preferences _wifiPrefs;
 
+bool cfgIsRuntimeDefaultDueLoadFailure() {
+  return cfgRuntimeDefaultDueLoadFailure;
+}
+
+static void initDayOfftime(DaySchedule& d);
+
+static bool copyConfigFile(const char* srcPath, const char* dstPath) {
+  File src = LittleFS.open(srcPath, "r");
+  if (!src) return false;
+
+  File dst = LittleFS.open(dstPath, "w");
+  if (!dst) {
+    src.close();
+    return false;
+  }
+
+  std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[256]);
+  if (!buf) {
+    src.close();
+    dst.close();
+    LittleFS.remove(dstPath);
+    return false;
+  }
+  bool ok = true;
+  while (src.available()) {
+    size_t n = src.read(buf.get(), 256);
+    if (n == 0) break;
+    if (dst.write(buf.get(), n) != n) {
+      ok = false;
+      break;
+    }
+    yield();
+  }
+
+  dst.flush();
+  dst.close();
+  src.close();
+
+  if (!ok) LittleFS.remove(dstPath);
+  return ok;
+}
+
+static bool recoverConfigFromBackup(const char* reason) {
+  const char* candidates[] = { CONFIG_TMP_PATH, CONFIG_BAK_PATH };
+  for (const char* candidate : candidates) {
+    if (!LittleFS.exists(candidate)) continue;
+    Serial.Printf("[Config] Attempting recovery from %s (%s)\n", candidate, reason ? reason : "-");
+    LittleFS.remove(CONFIG_PATH);
+    if (copyConfigFile(candidate, CONFIG_PATH)) {
+      Serial.Printf("[Config] Recovered active config from %s\n", candidate);
+      return true;
+    }
+  }
+  return false;
+}
+
+struct BinaryTimePeriod {
+  char start[6];
+  char end[6];
+  char mode[6];
+  char fan[8];
+  uint8_t set_temp;
+  uint8_t min_temp;
+  uint8_t max_temp;
+} __attribute__((packed));
+
+struct BinaryDaySchedule {
+  uint8_t type;
+  uint8_t periodCount;
+  BinaryTimePeriod periods[MAX_PERIODS_PER_DAY];
+} __attribute__((packed));
+
+struct BinaryScheduleFile {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  BinaryDaySchedule days[7];
+  uint32_t crc;
+} __attribute__((packed));
+
+struct BinaryTimePeriodV1 {
+  char start[6];
+  char end[6];
+  char mode[6];
+  char fan[8];
+  uint8_t set_temp;
+  uint8_t min_temp;
+  uint8_t max_temp;
+} __attribute__((packed));
+
+struct BinaryDayScheduleV1 {
+  uint8_t type;
+  uint8_t periodCount;
+  BinaryTimePeriodV1 periods[SCHEDULE_V1_MAX_PERIODS];
+} __attribute__((packed));
+
+struct BinaryScheduleFileV1 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  BinaryDayScheduleV1 days[7];
+  uint32_t crc;
+} __attribute__((packed));
+
+struct BinaryScheduleHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+} __attribute__((packed));
+
+static_assert(sizeof(BinaryTimePeriodV1) == sizeof(BinaryTimePeriod),
+              "Schedule V1 period layout must remain unchanged");
+
+template <typename T>
+static uint32_t calcScheduleCrc(const T& file) {
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&file);
+  const size_t crcOffset = offsetof(T, crc);
+  const size_t crcSize = sizeof(file.crc);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < sizeof(file); ++i) {
+    const uint8_t value = (i >= crcOffset && i < crcOffset + crcSize) ? 0 : bytes[i];
+    hash ^= value;
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+static void copyTextField(char* dst, size_t dstLen, const char* src) {
+  if (!dst || dstLen == 0) return;
+  memset(dst, 0, dstLen);
+  if (src) {
+    strncpy(dst, src, dstLen - 1);
+  }
+}
+
+static void buildScheduleFile(BinaryScheduleFile& out) {
+  memset(&out, 0, sizeof(out));
+  out.magic = SCHEDULE_MAGIC;
+  out.version = SCHEDULE_VERSION;
+  out.size = sizeof(BinaryScheduleFile);
+
+  for (uint8_t i = 0; i < 7; ++i) {
+    const DaySchedule& srcDay = cfg.setting.daily[i];
+    BinaryDaySchedule& dstDay = out.days[i];
+    dstDay.type = static_cast<uint8_t>(srcDay.type);
+    dstDay.periodCount = srcDay.periodCount;
+    if (dstDay.periodCount > MAX_PERIODS_PER_DAY) dstDay.periodCount = MAX_PERIODS_PER_DAY;
+
+    for (uint8_t p = 0; p < dstDay.periodCount; ++p) {
+      const TimePeriod& src = srcDay.periods[p];
+      BinaryTimePeriod& dst = dstDay.periods[p];
+      copyTextField(dst.start, sizeof(dst.start), src.start);
+      copyTextField(dst.end, sizeof(dst.end), src.end);
+      copyTextField(dst.mode, sizeof(dst.mode), src.mode);
+      copyTextField(dst.fan, sizeof(dst.fan), src.fan);
+      dst.set_temp = src.set_temp;
+      dst.min_temp = src.min_temp;
+      dst.max_temp = src.max_temp;
+    }
+  }
+
+  out.crc = calcScheduleCrc(out);
+}
+
+template <typename T>
+static bool applyScheduleFile(const T& file, uint16_t expectedVersion) {
+  if (file.magic != SCHEDULE_MAGIC || file.version != expectedVersion || file.size != sizeof(T)) {
+    return false;
+  }
+  if (file.crc != calcScheduleCrc(file)) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < 7; ++i) {
+    const auto& srcDay = file.days[i];
+    DaySchedule& dstDay = cfg.setting.daily[i];
+    memset(&dstDay, 0, sizeof(dstDay));
+
+    if (srcDay.type > DAY_PARTTIME) {
+      initDayOfftime(dstDay);
+      continue;
+    }
+
+    dstDay.type = static_cast<DayType>(srcDay.type);
+    dstDay.periodCount = srcDay.periodCount;
+    if (dstDay.type == DAY_OFFTIME) dstDay.periodCount = 0;
+    if (dstDay.periodCount > MAX_PERIODS_PER_DAY) dstDay.periodCount = MAX_PERIODS_PER_DAY;
+
+    for (uint8_t p = 0; p < dstDay.periodCount; ++p) {
+      const auto& src = srcDay.periods[p];
+      TimePeriod& dst = dstDay.periods[p];
+      copyTextField(dst.start, sizeof(dst.start), src.start);
+      copyTextField(dst.end, sizeof(dst.end), src.end);
+      copyTextField(dst.mode, sizeof(dst.mode), src.mode);
+      copyTextField(dst.fan, sizeof(dst.fan), src.fan);
+      dst.set_temp = src.set_temp;
+      dst.min_temp = src.min_temp;
+      dst.max_temp = src.max_temp;
+    }
+  }
+
+  return true;
+}
+
+static bool readScheduleBinaryFrom(const char* path, uint16_t& loadedVersion) {
+  loadedVersion = 0;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  BinaryScheduleHeader header = {};
+  const size_t headerRead = f.read(reinterpret_cast<uint8_t*>(&header), sizeof(header));
+  if (headerRead != sizeof(header) || header.magic != SCHEDULE_MAGIC) {
+    f.close();
+    return false;
+  }
+  f.seek(0);
+
+  if (header.version == SCHEDULE_VERSION_V1 &&
+      header.size == sizeof(BinaryScheduleFileV1) &&
+      f.size() == sizeof(BinaryScheduleFileV1)) {
+    std::unique_ptr<BinaryScheduleFileV1> file(new (std::nothrow) BinaryScheduleFileV1{});
+    if (!file) {
+      f.close();
+      return false;
+    }
+    const size_t bytesRead = f.read(reinterpret_cast<uint8_t*>(file.get()), sizeof(*file));
+    f.close();
+    if (bytesRead == sizeof(*file) && applyScheduleFile(*file, SCHEDULE_VERSION_V1)) {
+      loadedVersion = SCHEDULE_VERSION_V1;
+      return true;
+    }
+    return false;
+  }
+
+  if (header.version == SCHEDULE_VERSION &&
+      header.size == sizeof(BinaryScheduleFile) &&
+      f.size() == sizeof(BinaryScheduleFile)) {
+    std::unique_ptr<BinaryScheduleFile> file(new (std::nothrow) BinaryScheduleFile{});
+    if (!file) {
+      f.close();
+      return false;
+    }
+    const size_t bytesRead = f.read(reinterpret_cast<uint8_t*>(file.get()), sizeof(*file));
+    f.close();
+    if (bytesRead == sizeof(*file) && applyScheduleFile(*file, SCHEDULE_VERSION)) {
+      loadedVersion = SCHEDULE_VERSION;
+      return true;
+    }
+    return false;
+  }
+
+  f.close();
+  return false;
+}
+
+static bool saveScheduleBinary() {
+  std::unique_ptr<BinaryScheduleFile> file(new (std::nothrow) BinaryScheduleFile{});
+  if (!file) {
+    Serial.Println("[Config] Error: Cannot allocate binary schedule buffer");
+    return false;
+  }
+  buildScheduleFile(*file);
+
+  if (LittleFS.exists(SCHEDULE_NEW_PATH)) {
+    LittleFS.remove(SCHEDULE_NEW_PATH);
+  }
+
+  File f = LittleFS.open(SCHEDULE_NEW_PATH, "w");
+  if (!f) {
+    Serial.Println("[Config] Error: Cannot open temp schedule for write");
+    return false;
+  }
+
+  size_t written = f.write(reinterpret_cast<const uint8_t*>(file.get()), sizeof(*file));
+  f.flush();
+  f.close();
+
+  if (written != sizeof(*file)) {
+    Serial.Println("[Config] Error: Failed to write binary schedule");
+    LittleFS.remove(SCHEDULE_NEW_PATH);
+    return false;
+  }
+
+  bool activeMovedToBackup = false;
+  if (LittleFS.exists(SCHEDULE_PATH)) {
+    LittleFS.remove(SCHEDULE_BAK_PATH);
+    if (!LittleFS.rename(SCHEDULE_PATH, SCHEDULE_BAK_PATH)) {
+      Serial.Println("[Config] Error: Cannot preserve old binary schedule");
+      return false;
+    }
+    activeMovedToBackup = true;
+  }
+
+  if (!LittleFS.rename(SCHEDULE_NEW_PATH, SCHEDULE_PATH)) {
+    Serial.Println("[Config] Error: Cannot promote temp binary schedule");
+    if (activeMovedToBackup && !LittleFS.rename(SCHEDULE_BAK_PATH, SCHEDULE_PATH)) {
+      Serial.Println("[Config] Error: Cannot restore previous binary schedule");
+    }
+    return false;
+  }
+
+  LittleFS.remove(SCHEDULE_BAK_PATH);
+  if (!copyConfigFile(SCHEDULE_PATH, SCHEDULE_BAK_PATH)) {
+    Serial.Println("[Config] Warning: binary schedule saved, but backup copy failed");
+  }
+
+  Serial.Printf("[Config] Binary schedule saved: %u bytes\n", static_cast<unsigned>(sizeof(*file)));
+  return true;
+}
+
+bool cfgSaveSchedule() {
+  if (!LittleFS.begin()) {
+    Serial.Println("[Config] Error: LittleFS unavailable for schedule save");
+    return false;
+  }
+  return saveScheduleBinary();
+}
+
+static bool loadScheduleBinary() {
+  struct ScheduleCandidate {
+    const char* path;
+    const char* label;
+  };
+  const ScheduleCandidate candidates[] = {
+      {SCHEDULE_PATH, "active"},
+      {SCHEDULE_TMP_PATH, "temp"},
+      {SCHEDULE_BAK_PATH, "backup"},
+  };
+
+  for (const ScheduleCandidate& candidate : candidates) {
+    uint16_t loadedVersion = 0;
+    if (!readScheduleBinaryFrom(candidate.path, loadedVersion)) continue;
+
+    Serial.Printf("[Config] Binary schedule loaded from %s (v%u)\n",
+                  candidate.label,
+                  static_cast<unsigned>(loadedVersion));
+
+    const bool requiresRewrite = loadedVersion != SCHEDULE_VERSION ||
+                                 strcmp(candidate.path, SCHEDULE_PATH) != 0;
+    if (requiresRewrite) {
+      if (strcmp(candidate.path, SCHEDULE_BAK_PATH) == 0) {
+        LittleFS.remove(SCHEDULE_TMP_PATH);
+        if (!copyConfigFile(SCHEDULE_BAK_PATH, SCHEDULE_TMP_PATH)) {
+          Serial.Println("[Config] Warning: Cannot preserve backup source before migration");
+        }
+      }
+      if (!saveScheduleBinary()) {
+        Serial.Println("[Config] Warning: Schedule loaded but V2 rewrite failed");
+      } else if (loadedVersion == SCHEDULE_VERSION_V1) {
+        Serial.Println("[Config] Binary schedule migrated from V1 to V2");
+      }
+    }
+    return true;
+  }
+
+  return false;
+}
+
 String nvs_getWiFiSSID() {
   _wifiPrefs.begin("wifi", true);
+  bool exists = _wifiPrefs.isKey("ssid");
   String v = _wifiPrefs.getString("ssid", DEF_WIFI_SSID);
   _wifiPrefs.end();
+  // Jika key belum pernah ditulis, tulis sekarang agar OTA tidak bisa mengubahnya
+  if (!exists) {
+    _wifiPrefs.begin("wifi", false);
+    _wifiPrefs.putString("ssid", v);
+    _wifiPrefs.end();
+  }
   return v;
 }
 
 String nvs_getWiFiPass() {
   _wifiPrefs.begin("wifi", true);
+  bool exists = _wifiPrefs.isKey("pass");
   String v = _wifiPrefs.getString("pass", DEF_WIFI_PASS);
   _wifiPrefs.end();
+  // Jika key belum pernah ditulis, tulis sekarang agar OTA tidak bisa mengubahnya
+  if (!exists) {
+    _wifiPrefs.begin("wifi", false);
+    _wifiPrefs.putString("pass", v);
+    _wifiPrefs.end();
+  }
   return v;
 }
 
@@ -62,6 +464,17 @@ void nvs_setWiFiPass(const String& pass) {
   _wifiPrefs.begin("wifi", false);
   _wifiPrefs.putString("pass", pass);
   _wifiPrefs.end();
+}
+
+String getStableDeviceMac() {
+  uint8_t mac[6];
+  if (esp_efuse_mac_get_default(mac) == ESP_OK) {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", 
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(buf);
+  }
+  return WiFi.macAddress();
 }
 
 const char* PROD_ROOT_CA = R"EOF(
@@ -139,6 +552,15 @@ static void initDayParttime(DaySchedule& d,
   d.periods[0].max_temp = maxTemp;
 }
 
+static void initDefaultSchedule() {
+  // Day index standard: 0=Minggu, 1=Senin, ..., 6=Sabtu
+  initDayOfftime(cfg.setting.daily[0]);  // Minggu = libur
+  for (int i = 1; i <= 5; i++) {
+    initDayParttime(cfg.setting.daily[i], "07:55", "17:00"); // Senin-Jumat
+  }
+  initDayParttime(cfg.setting.daily[6], "07:55", "13:00");   // Sabtu = setengah hari
+}
+
 static void parsePeriodFromJson(TimePeriod& p, JsonObject pObj, bool isFulltime = false) {
   memset(&p, 0, sizeof(TimePeriod));
   if (!isFulltime) {
@@ -165,6 +587,7 @@ static void loadDefaultConfig() {
   cfg.koneksi.mqtt_port = DEF_MQTT_PORT;
   cfg.koneksi.mqtt_user = DEF_MQTT_USER;
   cfg.koneksi.mqtt_pass = DEF_MQTT_PASS;
+  cfg.koneksi.tz_offset = DEF_TZ_OFFSET;
 
   cfg.setting.automation = DEF_AUTOMATION;
   cfg.setting.global_set_temp = DEF_GLOBAL_SET_TEMP;
@@ -175,11 +598,7 @@ static void loadDefaultConfig() {
   cfg.setting.temp_cooldown_sec = DEF_TEMP_COOLDOWN;
   cfg.setting.auto_recovery_sec = 300; // 5 Menit (Standar aman kompresor)
 
-  for (int i = 0; i < 5; i++) {
-    initDayParttime(cfg.setting.daily[i], "07:55", "17:00");
-  }
-  initDayParttime(cfg.setting.daily[5], "07:55", "13:00");
-  initDayOfftime(cfg.setting.daily[6]);
+  initDefaultSchedule();
 
   cfg.setting.manualModeActive = false;
   cfg.setting.lastManualControlMs = 0;
@@ -206,7 +625,12 @@ bool cfgSave() {
   }
   // ==========================
 
-  StaticJsonDocument<6144> doc;
+  if (!saveScheduleBinary()) {
+    Serial.Println("[Config] Error: Binary schedule save failed, config not saved");
+    return false;
+  }
+
+  DynamicJsonDocument doc(CONFIG_JSON_DOC_CAPACITY);
 
   // Immutable metadata: always write from firmware constant
   cfg.ac_brand = AC_BRAND;
@@ -217,6 +641,7 @@ bool cfgSave() {
   koneksi["mqtt_port"] = cfg.koneksi.mqtt_port;
   koneksi["mqtt_user"] = cfg.koneksi.mqtt_user;
   koneksi["mqtt_pass"] = cfg.koneksi.mqtt_pass;
+  koneksi["tz_offset"] = cfg.koneksi.tz_offset;
 
   JsonObject setting = doc.createNestedObject("setting");
   setting["automation"] = cfg.setting.automation;
@@ -224,67 +649,22 @@ bool cfgSave() {
   setting["automationPausedByUser"] = cfg.setting.automationPausedByUser;
   setting["manualModeActive"] = cfg.setting.manualModeActive;
   setting["lastManualControlMs"] = (unsigned long)cfg.setting.lastManualControlMs;
-  
-  JsonArray schedule = setting.createNestedArray("schedule");
-  for (int i = 0; i < 7; ++i) {
-    JsonObject dayObj = schedule.createNestedObject();
-    dayObj["day"] = DAY_IDX_TO_NUM(i);
-    DaySchedule& d = cfg.setting.daily[i];
-    JsonArray dataArr = dayObj.createNestedArray("data");
-    if (d.type == DAY_OFFTIME) {
-      dayObj["type"] = "offtime";
-      continue;
-    }
-    dayObj["type"] = (d.type == DAY_FULLTIME) ? "fulltime" : "parttime";
-    uint8_t cnt = d.periodCount;
-    if (cnt > MAX_PERIODS_PER_DAY) cnt = MAX_PERIODS_PER_DAY;
-    for (uint8_t p = 0; p < cnt; p++) {
-      JsonObject po = dataArr.createNestedObject();
-      if (d.type == DAY_PARTTIME) {
-        po["start"] = d.periods[p].start;
-        po["end"] = d.periods[p].end;
-      }
-      po["mode"] = d.periods[p].mode;
-      po["fan"] = d.periods[p].fan;
-      po["set_temp"] = d.periods[p].set_temp;
-      po["min_temp"] = d.periods[p].min_temp;
-      po["max_temp"] = d.periods[p].max_temp;
-    }
+  setting["schedule_storage"] = "binary";
+  setting["schedule_version"] = SCHEDULE_VERSION;
+
+  if (doc.overflowed()) {
+    Serial.Println("[Config] Error: JSON document overflow, config not saved");
+    return false;
   }
 
-  // Hapus file lama
-  if (LittleFS.exists(CONFIG_PATH)) {
-    LittleFS.remove(CONFIG_PATH);
+  if (LittleFS.exists(CONFIG_TMP_PATH)) {
+    LittleFS.remove(CONFIG_TMP_PATH);
   }
 
-  File f = LittleFS.open(CONFIG_PATH, "w");
-  
-  // SELF-HEALING BLOCK
-  if (!f) {
-    Serial.Println("[Config] Error: File creation failed. Filesystem corrupt?");
-    Serial.Println("[Config] ACTION: Formatting LittleFS...");
-    
-    LittleFS.end();
-    // Format
-    if (LittleFS.format()) {
-      Serial.Println("[Config] Format success. Waiting to stabilize...");
-      delay(100); // Beri jeda sedikit
-      
-      // Remount dengan formatOnFail = true
-      if (LittleFS.begin(true)) {
-        Serial.Println("[Config] Remounted. Retrying open...");
-        // Coba buka file sekali lagi
-        f = LittleFS.open(CONFIG_PATH, "w");
-      } else {
-        Serial.Println("[Config] Remount failed after format.");
-      }
-    } else {
-      Serial.Println("[Config] Format failed.");
-    }
-  }
+  File f = LittleFS.open(CONFIG_TMP_PATH, "w");
 
   if (!f) {
-    Serial.Println("[Config] Error: Cannot open config for write (Persistent failure)");
+    Serial.Println("[Config] Error: Cannot open temp config for write (Persistent failure)");
     return false;
   }
 
@@ -293,39 +673,108 @@ bool cfgSave() {
   
   if (bytesWritten == 0) {
     Serial.Println("[Config] Error: Failed to write config (0 bytes written)");
+    LittleFS.remove(CONFIG_TMP_PATH);
     return false;
   }
 
+  if (LittleFS.exists(CONFIG_PATH) && !LittleFS.remove(CONFIG_PATH)) {
+    Serial.Println("[Config] Error: Cannot remove old config, keeping temp file");
+    return false;
+  }
+
+  if (!LittleFS.rename(CONFIG_TMP_PATH, CONFIG_PATH)) {
+    Serial.Println("[Config] Error: Cannot promote temp config to active config");
+    return false;
+  }
+
+  LittleFS.remove(CONFIG_BAK_PATH);
+  if (!copyConfigFile(CONFIG_PATH, CONFIG_BAK_PATH)) {
+    Serial.Println("[Config] Warning: active config saved, but backup copy failed");
+  }
+
   Serial.Printf("[Config] Successfully saved %d bytes to %s\n", bytesWritten, CONFIG_PATH);
+  cfgRuntimeDefaultDueLoadFailure = false;
   return true;
 } 
 
+static void cfgDeferredDefaultSaveTask(void*) {
+  Serial.Println("[Config] Deferred default config save started");
+  const bool saved = cfgSave();
+  cfgRuntimeDefaultDueLoadFailure = !saved;
+  cfgDeferredDefaultSaveStarted = false;
+  Serial.Printf("[Config] Deferred default config save %s\n", saved ? "succeeded" : "failed");
+  vTaskDelete(nullptr);
+}
+
+void cfgStartDeferredDefaultSave() {
+  if (!cfgRuntimeDefaultDueLoadFailure || cfgDeferredDefaultSaveStarted) return;
+
+  cfgDeferredDefaultSaveStarted = true;
+  const BaseType_t created = xTaskCreate(
+      cfgDeferredDefaultSaveTask,
+      "CfgSave",
+      8192,
+      nullptr,
+      1,
+      nullptr);
+  if (created != pdPASS) {
+    cfgDeferredDefaultSaveStarted = false;
+    Serial.Println("[Config] ERROR: Cannot create deferred default save task");
+  }
+}
+
 bool cfgLoad() {
+  static bool recoveryAttempted = false;
+  cfgRuntimeDefaultDueLoadFailure = false;
+
   if (!LittleFS.begin()) {
     Serial.Println("WARNING: LittleFS not mounted, using default config");
     loadDefaultConfig();
+    cfgRuntimeDefaultDueLoadFailure = true;
     return false;
   }
 
   if (!LittleFS.exists(CONFIG_PATH)) {
-    Serial.Println("WARNING: Config file not found, creating default config");
+    if (!recoveryAttempted && recoverConfigFromBackup("active config missing")) {
+      recoveryAttempted = true;
+      bool ok = cfgLoad();
+      recoveryAttempted = false;
+      return ok;
+    }
+    Serial.Println("WARNING: Config file not found, loading default config");
     loadDefaultConfig();
-    return cfgSave();
+    cfgRuntimeDefaultDueLoadFailure = true;
+    return false;
   }
 
   File f = LittleFS.open(CONFIG_PATH, "r");
   if (!f) {
+    if (!recoveryAttempted && recoverConfigFromBackup("active config open failed")) {
+      recoveryAttempted = true;
+      bool ok = cfgLoad();
+      recoveryAttempted = false;
+      return ok;
+    }
     Serial.Println("ERROR: Cannot open config for read");
     loadDefaultConfig();
+    cfgRuntimeDefaultDueLoadFailure = true;
     return false;
   }
 
   size_t size = f.size();
   
-  if (size > 8192) {
-    Serial.Println("ERROR: Config file too large (>8KB), possibly corrupt");
+  if (size > CONFIG_FILE_MAX_BYTES) {
+    Serial.Printf("ERROR: Config file too large (%u > %u), possibly corrupt\n",
+                  (unsigned)size, (unsigned)CONFIG_FILE_MAX_BYTES);
     f.close();
+    if (!recoveryAttempted && recoverConfigFromBackup("active config too large")) {
+      recoveryAttempted = true;
+      bool ok = cfgLoad();
+      recoveryAttempted = false;
+      return ok;
+    }
     loadDefaultConfig();
+    cfgRuntimeDefaultDueLoadFailure = true;
     return false;
   }
   
@@ -333,7 +782,14 @@ bool cfgLoad() {
   if (!buf) {
     Serial.Println("ERROR: Failed to allocate memory for config");
     f.close();
+    if (!recoveryAttempted && recoverConfigFromBackup("config buffer allocation failed")) {
+      recoveryAttempted = true;
+      bool ok = cfgLoad();
+      recoveryAttempted = false;
+      return ok;
+    }
     loadDefaultConfig();
+    cfgRuntimeDefaultDueLoadFailure = true;
     return false;
   }
   
@@ -341,12 +797,19 @@ bool cfgLoad() {
   buf[size] = '\0';
   f.close();
 
-  StaticJsonDocument<4096> doc;
+  DynamicJsonDocument doc((size_t)size * 2 + 1024);
   DeserializationError err = deserializeJson(doc, buf.get());
   if (err) {
     Serial.print("ERROR: Parse config error: ");
     Serial.Println(err.c_str());
+    if (!recoveryAttempted && recoverConfigFromBackup("active config parse failed")) {
+      recoveryAttempted = true;
+      bool ok = cfgLoad();
+      recoveryAttempted = false;
+      return ok;
+    }
     loadDefaultConfig();
+    cfgRuntimeDefaultDueLoadFailure = true;
     return false;
   }
 
@@ -354,7 +817,7 @@ bool cfgLoad() {
   // [FIXED] Load config dari file - TIDAK overwrite dengan DEF_*
   // DEF_* hanya digunakan sebagai fallback jika key tidak ada di file
   // ═══════════════════════════════════════════════════════════════════
-  
+  cfg.device_id = getStableDeviceMac();
   // Immutable metadata: always forced to firmware constant
   cfg.ac_brand = AC_BRAND;
 
@@ -366,6 +829,7 @@ bool cfgLoad() {
     cfg.koneksi.mqtt_port = k["mqtt_port"] | DEF_MQTT_PORT;
     cfg.koneksi.mqtt_user = k["mqtt_user"] | DEF_MQTT_USER;
     cfg.koneksi.mqtt_pass = k["mqtt_pass"] | DEF_MQTT_PASS;
+    cfg.koneksi.tz_offset = k["tz_offset"] | DEF_TZ_OFFSET;
   } else {
     cfg.koneksi.wifi_ssid = nvs_getWiFiSSID();
     cfg.koneksi.wifi_pass = nvs_getWiFiPass();
@@ -373,12 +837,14 @@ bool cfgLoad() {
     cfg.koneksi.mqtt_port = DEF_MQTT_PORT;
     cfg.koneksi.mqtt_user = DEF_MQTT_USER;
     cfg.koneksi.mqtt_pass = DEF_MQTT_PASS;
+    cfg.koneksi.tz_offset = DEF_TZ_OFFSET;
   }
   
   // Trim whitespace dari WiFi credentials
   cfg.koneksi.wifi_ssid.trim();
   cfg.koneksi.wifi_pass.trim();
 
+  bool legacyScheduleLoaded = false;
   JsonObject s = doc["setting"].as<JsonObject>();
   if (!s.isNull()) {
     if (s.containsKey("automation")) {
@@ -423,47 +889,51 @@ bool cfgLoad() {
 
     if (s.containsKey("schedule")) {
       JsonArray schedule = s["schedule"].as<JsonArray>();
-      for (JsonObject dayObj : schedule) {
-        if (!dayObj.containsKey("day") || !dayObj["day"].is<int>()) continue;
-        int dayNum = dayObj["day"].as<int>();
-        int idx = -1;
-        if (dayNum >= 0 && dayNum <= 6) {
-          // New standard: Senin=0..Minggu=6
-          idx = DAY_NUM_TO_IDX(dayNum);
-        } else if (dayNum >= 1 && dayNum <= 7) {
-          // Legacy (old firmware): Senin=1..Minggu=7
-          idx = dayNum - 1;
-        } else {
-          continue;
-        }
-        if (idx < 0 || idx > 6) continue;
-        const char* type = dayObj["type"] | "offtime";
-
-        if (strcasecmp(type, "offtime") == 0) {
-          initDayOfftime(cfg.setting.daily[idx]);
-          continue;
-        }
-
-        JsonArray data = dayObj["data"].as<JsonArray>();
-        if (strcasecmp(type, "fulltime") == 0) {
-          initDayFulltime(cfg.setting.daily[idx]);
-          if (!data.isNull() && data.size() > 0) {
-            parsePeriodFromJson(cfg.setting.daily[idx].periods[0], data[0].as<JsonObject>(), true);
+      if (!schedule.isNull()) {
+        legacyScheduleLoaded = true;
+        for (JsonObject dayObj : schedule) {
+          if (!dayObj.containsKey("day") || !dayObj["day"].is<int>()) continue;
+          int dayNum = dayObj["day"].as<int>();
+          int idx = -1;
+          if (dayNum >= 0 && dayNum <= 6) {
+            // New standard: Minggu=0, Senin=1, ..., Sabtu=6
+            idx = DAY_NUM_TO_IDX(dayNum);
+          } else if (dayNum >= 1 && dayNum <= 7) {
+            // Legacy (old firmware): Senin=1..Minggu=7
+            if (dayNum == 7) idx = 0; // Minggu
+            else idx = dayNum; // Senin(1) - Sabtu(6)
+          } else {
+            continue;
           }
-          continue;
-        }
+          if (idx < 0 || idx > 6) continue;
+          const char* type = dayObj["type"] | "offtime";
 
-        initDayParttime(cfg.setting.daily[idx], "08:00", "17:00");
-        cfg.setting.daily[idx].periodCount = 0;
-        uint8_t count = 0;
-        for (JsonObject pObj : data) {
-          if (count >= MAX_PERIODS_PER_DAY) break;
-          parsePeriodFromJson(cfg.setting.daily[idx].periods[count], pObj, false);
-          count++;
-        }
-        cfg.setting.daily[idx].periodCount = count;
-        if (cfg.setting.daily[idx].periodCount == 0) {
-          initDayOfftime(cfg.setting.daily[idx]);
+          if (strcasecmp(type, "offtime") == 0) {
+            initDayOfftime(cfg.setting.daily[idx]);
+            continue;
+          }
+
+          JsonArray data = dayObj["data"].as<JsonArray>();
+          if (strcasecmp(type, "fulltime") == 0) {
+            initDayFulltime(cfg.setting.daily[idx]);
+            if (!data.isNull() && data.size() > 0) {
+              parsePeriodFromJson(cfg.setting.daily[idx].periods[0], data[0].as<JsonObject>(), true);
+            }
+            continue;
+          }
+
+          initDayParttime(cfg.setting.daily[idx], "08:00", "17:00");
+          cfg.setting.daily[idx].periodCount = 0;
+          uint8_t count = 0;
+          for (JsonObject pObj : data) {
+            if (count >= MAX_PERIODS_PER_DAY) break;
+            parsePeriodFromJson(cfg.setting.daily[idx].periods[count], pObj, false);
+            count++;
+          }
+          cfg.setting.daily[idx].periodCount = count;
+          if (cfg.setting.daily[idx].periodCount == 0) {
+            initDayOfftime(cfg.setting.daily[idx]);
+          }
         }
       }
     }
@@ -477,10 +947,19 @@ bool cfgLoad() {
     cfg.setting.temp_cooldown_sec = DEF_TEMP_COOLDOWN;
     cfg.setting.auto_recovery_sec = DEF_AUTO_RECOVERY;
 
-    for (int i = 0; i < 5; i++) initDayParttime(cfg.setting.daily[i], "07:55", "17:00");
-    initDayParttime(cfg.setting.daily[5], "07:55", "13:00");
-    initDayOfftime(cfg.setting.daily[6]);
+    initDefaultSchedule();
     cfg.setting.automationPausedByUser = false;
+  }
+
+  if (loadScheduleBinary()) {
+    legacyScheduleLoaded = false;
+  } else if (legacyScheduleLoaded) {
+    Serial.Println("[Config] Migrating legacy JSON schedule to binary storage");
+    saveScheduleBinary();
+  } else {
+    Serial.Println("[Config] Binary schedule missing, using default schedule");
+    initDefaultSchedule();
+    saveScheduleBinary();
   }
 
   Serial.Printf("[Config] Loaded - automation: %s\n",
@@ -563,7 +1042,7 @@ bool cfgConnectWiFiBlocking() {
     // Set WiFi mode and begin connection
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.persistent(true);
+    WiFi.persistent(false);  // Credentials dikelola sendiri via NVS Preferences — jangan biarkan WiFi library menimpa
     
     // Start connection
     WiFi.begin(cfg.koneksi.wifi_ssid.c_str(), cfg.koneksi.wifi_pass.c_str());
@@ -685,8 +1164,10 @@ bool cfgSyncFromRTC() {
     return false;
   }
   
-  // Set timezone untuk WIB (GMT+7) terlebih dahulu
-  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  // Set timezone dinamis berdasarkan config (WIB=7, WITA=8, WIT=9)
+  String tz = cfgGetTZString(cfg.koneksi.tz_offset);
+  setenv("TZ", tz.c_str(), 1);
+  tzset();
   
   // Buat struktur waktu dari RTC (anggap RTC sudah menyimpan waktu WIB)
   struct tm t;
@@ -720,13 +1201,20 @@ void cfgSyncTime(unsigned long timeoutMs) {
     esp_task_wdt_reset();
     yield();
 
-    // Jangan percaya waktu sistem yang sudah ada sebelum SNTP benar-benar complete.
+    // Gunakan esp_sntp_* API yang menangani TCPIP locking secara internal
+    // (configTime() memanggil raw lwIP tanpa lock - crash pada ESP-IDF v5.x)
     if (esp_sntp_enabled()) {
       esp_sntp_stop();
     }
-    
-    // Set timezone untuk WIB (GMT+7) sebelum sinkronisasi NTP
-    configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    // Set timezone dinamis berdasarkan config
+    String tz = cfgGetTZString(cfg.koneksi.tz_offset);
+    setenv("TZ", tz.c_str(), 1);
+    tzset();
+    // Konfigurasi dan mulai SNTP
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.nist.gov");
+    esp_sntp_init();
     
     unsigned long start = millis();
     now = time(nullptr);
